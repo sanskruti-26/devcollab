@@ -15,16 +15,19 @@ const { setupSocketHandlers } = require("./services/roomService");
 const app = express();
 const server = http.createServer(app);
 
+// Trim whitespace/newlines Render sometimes injects into env var values
+const CLIENT_URL = (process.env.CLIENT_URL || "http://localhost:5173").trim();
+
 // Socket.io setup — allow requests from the frontend
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_URL || "http://localhost:5173",
+    origin: CLIENT_URL,
     methods: ["GET", "POST"],
   },
 });
 
 // Middleware
-app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:5173" }));
+app.use(cors({ origin: CLIENT_URL }));
 app.use(express.json());
 
 // Routes
