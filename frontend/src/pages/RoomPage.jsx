@@ -222,13 +222,13 @@ export default function RoomPage() {
     if (socketSetup.current) return; // already connected
     socketSetup.current = true;
 
-    socket.connect();
-    socket.emit("join-room", { roomId, userName: user?.name || "Anonymous" });
-
-    // If the backend restarts, re-join the room automatically
-    socket.on("reconnect", () => {
+    // "connect" fires on initial connect AND every reconnect in Socket.io v4
+    // (socket.on("reconnect") is a Manager event and won't fire on the socket instance)
+    socket.on("connect", () => {
       socket.emit("join-room", { roomId, userName: user?.name || "Anonymous" });
     });
+
+    socket.connect();
 
     socket.on("init-code", ({ code: initCode }) => {
       const current = editorRef.current?.getModel()?.getValue();
@@ -360,18 +360,23 @@ export default function RoomPage() {
     if (runningBy) return; // block if someone is already running
     const name = user?.name || "Anonymous";
 
-    // Tell everyone (including ourselves) that execution started
+    // Update local state immediately so the runner sees the panel right away
+    // (don't wait for the server echo — that's only needed for other users)
+    setRunningBy(name);
+    setRunOutput(null);
     socket.emit("run-start", { roomId, runnerName: name });
 
     try {
       const { data } = await api.post("/api/v1/rooms/execute", { code, language });
-      socket.emit("run-result", { roomId, output: data.output || "(no output)", runnerName: name });
+      const output = data.output || "(no output)";
+      setRunningBy(null);
+      setRunOutput({ output, by: name });
+      socket.emit("run-result", { roomId, output, runnerName: name });
     } catch (err) {
-      socket.emit("run-result", {
-        roomId,
-        output: `Error: ${err.response?.data?.error || err.message}`,
-        runnerName: name,
-      });
+      const output = `Error: ${err.response?.data?.error || err.message}`;
+      setRunningBy(null);
+      setRunOutput({ output, by: name });
+      socket.emit("run-result", { roomId, output, runnerName: name });
     }
   }
 
