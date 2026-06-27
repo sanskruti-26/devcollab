@@ -62,6 +62,9 @@ export default function RoomPage() {
   // Toast notifications
   const [toasts, setToasts] = useState([]);
 
+  // Share modal
+  const [shareOpen, setShareOpen] = useState(false);
+
   const isRemoteChange = useRef(false);
   const editorRef = useRef(null);
   const chatEndRef = useRef(null);
@@ -237,6 +240,18 @@ export default function RoomPage() {
     setTimeout(() => setCopied(false), 2000);
   }
 
+  function downloadCode() {
+    const extensions = { javascript: "js", typescript: "ts", python: "py", java: "java", cpp: "cpp" };
+    const ext = extensions[language] || "txt";
+    const blob = new Blob([code], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `code.${ext}`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   function handleMessageChange(e) {
     setNewMessage(e.target.value);
     socket.emit("typing-start", { roomId });
@@ -317,25 +332,37 @@ export default function RoomPage() {
             {isRunning ? "Running..." : "▶ Run"}
           </button>
 
-          {/* Participant avatars — each uses the same color as their cursor */}
+          {/* Participant avatars with online green dot */}
           <div className="flex -space-x-1">
             {participants.slice(0, 4).map((p) => (
-              <div
-                key={p.socketId}
-                title={p.userName}
-                style={{ backgroundColor: getCursorColor(p.socketId) }}
-                className="w-7 h-7 rounded-full border-2 border-gray-900 flex items-center justify-center text-xs font-bold text-white"
-              >
-                {p.userName[0]?.toUpperCase()}
+              <div key={p.socketId} className="relative">
+                <div
+                  title={p.userName}
+                  style={{ backgroundColor: getCursorColor(p.socketId) }}
+                  className="w-7 h-7 rounded-full border-2 border-gray-900 flex items-center justify-center text-xs font-bold text-white"
+                >
+                  {p.userName[0]?.toUpperCase()}
+                </div>
+                <span className="absolute bottom-0 right-0 w-2 h-2 bg-green-400 rounded-full border border-gray-900" />
               </div>
             ))}
           </div>
 
+          {/* Download button */}
           <button
-            onClick={copyShareLink}
+            onClick={downloadCode}
+            title="Download code"
             className="bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-3 py-1 rounded-lg text-sm transition"
           >
-            {copied ? "✓ Copied!" : "Share"}
+            ⬇ Download
+          </button>
+
+          {/* Share button — opens modal */}
+          <button
+            onClick={() => setShareOpen(true)}
+            className="bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-3 py-1 rounded-lg text-sm transition"
+          >
+            Share
           </button>
 
           <button
@@ -459,6 +486,44 @@ export default function RoomPage() {
         <span>{participants.length} user{participants.length !== 1 ? "s" : ""} online</span>
         <span>Auto-saves every 5 seconds</span>
       </div>
+
+      {/* Share modal */}
+      {shareOpen && (
+        <div
+          className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center"
+          onClick={() => setShareOpen(false)}
+        >
+          <div
+            className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-96 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-white font-semibold mb-1">Invite collaborators</h3>
+            <p className="text-gray-400 text-sm mb-4">
+              Share this link — anyone with it can join the room
+            </p>
+            <div className="flex gap-2">
+              <input
+                readOnly
+                value={window.location.href}
+                className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none select-all"
+                onFocus={(e) => e.target.select()}
+              />
+              <button
+                onClick={copyShareLink}
+                className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition"
+              >
+                {copied ? "✓" : "Copy"}
+              </button>
+            </div>
+            <button
+              onClick={() => setShareOpen(false)}
+              className="mt-4 w-full text-gray-500 hover:text-gray-300 text-sm transition"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
