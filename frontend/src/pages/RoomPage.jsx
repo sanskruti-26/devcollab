@@ -70,9 +70,9 @@ export default function RoomPage() {
   const [newMessage, setNewMessage] = useState("");
   const [typingUsers, setTypingUsers] = useState([]);
 
-  // Code execution
-  const [runOutput, setRunOutput] = useState(null);
-  const [isRunning, setIsRunning] = useState(false);
+  // Code execution — shared across all users via socket
+  const [runOutput, setRunOutput] = useState(null);  // { output, by } | null
+  const [runningBy, setRunningBy] = useState(null);  // name of whoever clicked Run
 
   // Toasts
   const [toasts, setToasts] = useState([]);
@@ -225,6 +225,11 @@ export default function RoomPage() {
     socket.connect();
     socket.emit("join-room", { roomId, userName: user?.name || "Anonymous" });
 
+    // If the backend restarts, re-join the room automatically
+    socket.on("reconnect", () => {
+      socket.emit("join-room", { roomId, userName: user?.name || "Anonymous" });
+    });
+
     socket.on("init-code", ({ code: initCode }) => {
       const current = editorRef.current?.getModel()?.getValue();
       if (current !== initCode) {
@@ -254,6 +259,16 @@ export default function RoomPage() {
 
     socket.on("cursor-update", ({ socketId, userName, position, selection }) => {
       updateRemoteCursor(socketId, userName, position, selection);
+    });
+
+    // Shared code execution events
+    socket.on("run-start", ({ runnerName }) => {
+      setRunningBy(runnerName);
+      setRunOutput(null);
+    });
+    socket.on("run-result", ({ output, runnerName }) => {
+      setRunningBy(null);
+      setRunOutput({ output, by: runnerName });
     });
 
     socket.on("message-history", (msgs) => setMessages(msgs));
@@ -342,15 +357,21 @@ export default function RoomPage() {
   }
 
   async function runCode() {
-    setIsRunning(true);
-    setRunOutput("Running...");
+    if (runningBy) return; // block if someone is already running
+    const name = user?.name || "Anonymous";
+
+    // Tell everyone (including ourselves) that execution started
+    socket.emit("run-start", { roomId, runnerName: name });
+
     try {
       const { data } = await api.post("/api/v1/rooms/execute", { code, language });
-      setRunOutput(data.output || "(no output)");
+      socket.emit("run-result", { roomId, output: data.output || "(no output)", runnerName: name });
     } catch (err) {
-      setRunOutput(`Error: ${err.response?.data?.error || err.message}`);
-    } finally {
-      setIsRunning(false);
+      socket.emit("run-result", {
+        roomId,
+        output: `Error: ${err.response?.data?.error || err.message}`,
+        runnerName: name,
+      });
     }
   }
 
@@ -435,13 +456,13 @@ export default function RoomPage() {
             {THEMES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
           </select>
 
-          {/* Run */}
+          {/* Run — disabled while anyone in the room is running */}
           <button
             onClick={runCode}
-            disabled={isRunning}
+            disabled={!!runningBy}
             className="bg-green-600 hover:bg-green-500 disabled:bg-green-900 disabled:text-green-700 text-white px-3 py-1 rounded-lg text-sm font-medium transition"
           >
-            {isRunning ? "Running..." : "▶ Run"}
+            {runningBy ? `${runningBy.split(" ")[0]} running...` : "▶ Run"}
           </button>
 
           {/* Participant avatars with online dot */}
@@ -497,14 +518,30 @@ export default function RoomPage() {
             />
           </div>
 
-          {runOutput !== null && (
+          {(runOutput !== null || runningBy !== null) && (
             <div className="h-40 border-t border-gray-800 bg-gray-950 flex flex-col flex-shrink-0">
               <div className="flex items-center justify-between px-4 py-1.5 border-b border-gray-800">
-                <span className="text-gray-400 text-xs font-mono font-semibold tracking-widest">OUTPUT</span>
-                <button onClick={() => setRunOutput(null)} className="text-gray-600 hover:text-gray-300 text-xs transition">✕ close</button>
+                <div className="flex items-center gap-2">
+                  <span className="text-gray-400 text-xs font-mono font-semibold tracking-widest">OUTPUT</span>
+                  {runOutput?.by && (
+                    <span className="text-gray-600 text-xs">· ran by {runOutput.by}</span>
+                  )}
+                </div>
+                <button
+                  onClick={() => { setRunOutput(null); setRunningBy(null); }}
+                  className="text-gray-600 hover:text-gray-300 text-xs transition"
+                >
+                  ✕ close
+                </button>
               </div>
               <div className="flex-1 overflow-y-auto px-4 py-2">
-                <pre className="text-green-400 text-sm font-mono whitespace-pre-wrap">{runOutput}</pre>
+                {runningBy ? (
+                  <p className="text-yellow-400 text-sm font-mono italic">
+                    {runningBy} is running the code...
+                  </p>
+                ) : (
+                  <pre className="text-green-400 text-sm font-mono whitespace-pre-wrap">{runOutput?.output}</pre>
+                )}
               </div>
             </div>
           )}
