@@ -19,6 +19,8 @@ const roomSchema = new mongoose.Schema(
     owner: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     // Everyone who has ever joined
     participants: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+    // Optional room password (stored as bcrypt hash, null = public room)
+    password: { type: String, default: null },
   },
   { timestamps: true }
 );

@@ -1,4 +1,4 @@
-// pages/RoomPage.jsx — the main collaborative editor page
+// pages/RoomPage.jsx — collaborative editor with live cursors, chat, and more
 import { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import Editor from "@monaco-editor/react";
@@ -16,15 +16,20 @@ const MONACO_LANG = {
   cpp: "cpp",
 };
 
-// One color per remote user — assigned by hashing their socket ID
 const CURSOR_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899", "#ef4444"];
+
+const THEMES = [
+  { value: "vs-dark", label: "Dark" },
+  { value: "vs", label: "Light" },
+  { value: "hc-black", label: "High Contrast" },
+];
 
 function getCursorColor(socketId) {
   const hash = [...socketId].reduce((acc, c) => acc + c.charCodeAt(0), 0);
   return CURSOR_COLORS[hash % CURSOR_COLORS.length];
 }
 
-// Injects a <style> tag so Monaco can color a remote user's cursor line
+// Injects CSS for a user's cursor line highlight and selection highlight
 function injectCursorCSS(socketId, color) {
   if (document.getElementById(`cstyle-${socketId}`)) return;
   const [r, g, b] = [
@@ -34,7 +39,10 @@ function injectCursorCSS(socketId, color) {
   ];
   const el = document.createElement("style");
   el.id = `cstyle-${socketId}`;
-  el.textContent = `.rcursor-${socketId} { background: rgba(${r},${g},${b},0.18) !important; border-left: 2px solid ${color} !important; }`;
+  el.textContent = `
+    .rcursor-${socketId}    { background: rgba(${r},${g},${b},0.18) !important; border-left: 2px solid ${color} !important; }
+    .rselection-${socketId} { background: rgba(${r},${g},${b},0.28) !important; }
+  `;
   document.head.appendChild(el);
 }
 
@@ -46,43 +54,54 @@ export default function RoomPage() {
   const [room, setRoom] = useState(null);
   const [code, setCode] = useState("// Loading...");
   const [language, setLanguage] = useState("javascript");
+  const [editorTheme, setEditorTheme] = useState("vs-dark");
   const [participants, setParticipants] = useState([]);
   const [copied, setCopied] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
 
-  // Chat state
+  // Password protection
+  const [passwordRequired, setPasswordRequired] = useState(false);
+  const [roomPassword, setRoomPassword] = useState("");
+  const [passwordError, setPasswordError] = useState("");
+
+  // Chat
   const [chatOpen, setChatOpen] = useState(false);
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState("");
-  const [typingUsers, setTypingUsers] = useState([]); // names of users currently typing
+  const [typingUsers, setTypingUsers] = useState([]);
 
-  // Code execution state
+  // Code execution
   const [runOutput, setRunOutput] = useState(null);
   const [isRunning, setIsRunning] = useState(false);
 
-  // Toast notifications
+  // Toasts
   const [toasts, setToasts] = useState([]);
-
-  // Share modal
-  const [shareOpen, setShareOpen] = useState(false);
 
   const isRemoteChange = useRef(false);
   const editorRef = useRef(null);
   const chatEndRef = useRef(null);
-  const typingTimerRef = useRef(null);       // debounce for typing-stop
-  const lastCursorEmit = useRef(0);          // throttle cursor-move emissions
-  const decorationCollections = useRef(new Map()); // socketId -> Monaco decoration collection
+  const typingTimerRef = useRef(null);
+  const lastCursorEmit = useRef(0);
+  const socketSetup = useRef(false);               // prevent duplicate event registration
+  const decorationCollections = useRef(new Map()); // socketId -> line highlight collection
+  const selectionCollections = useRef(new Map());  // socketId -> selection highlight collection
+  const cursorWidgets = useRef(new Map());         // socketId -> { widget, domNode }
 
   useEffect(() => {
     loadRoom();
-    connectSocket();
-
     return () => {
       socket.emit("leave-room", { roomId });
       socket.disconnect();
+      socketSetup.current = false;
       clearTimeout(typingTimerRef.current);
-      // Clean up all cursor decorations
-      decorationCollections.current.forEach((col) => col.clear());
+      decorationCollections.current.forEach((c) => c.clear());
       decorationCollections.current.clear();
+      selectionCollections.current.forEach((c) => c.clear());
+      selectionCollections.current.clear();
+      cursorWidgets.current.forEach(({ widget }) => {
+        editorRef.current?.removeContentWidget(widget);
+      });
+      cursorWidgets.current.clear();
     };
   }, [roomId]);
 
@@ -96,61 +115,113 @@ export default function RoomPage() {
     setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 3000);
   }
 
-  // Highlight the line where a remote user's cursor sits
-  function updateRemoteCursor(socketId, position) {
+  // Update or add the floating name label above a remote user's cursor
+  function updateCursorWidget(socketId, userName, lineNumber) {
+    const editor = editorRef.current;
+    if (!editor) return;
+
+    const color = getCursorColor(socketId);
+    const existing = cursorWidgets.current.get(socketId);
+
+    // Remove old widget so we can re-add at the new line
+    if (existing) editor.removeContentWidget(existing.widget);
+
+    const domNode = document.createElement("div");
+    domNode.textContent = userName;
+    domNode.style.cssText = `background:${color};color:white;font-size:11px;padding:1px 6px;border-radius:3px 3px 3px 0;white-space:nowrap;pointer-events:none;font-family:-apple-system,sans-serif;line-height:16px;`;
+
+    const widget = {
+      getId: () => `clabel-${socketId}`,
+      getDomNode: () => domNode,
+      getPosition: () => ({
+        position: { lineNumber, column: 1 },
+        preference: [1], // 1 = ContentWidgetPositionPreference.ABOVE
+      }),
+    };
+
+    editor.addContentWidget(widget);
+    cursorWidgets.current.set(socketId, { widget, domNode });
+  }
+
+  function updateRemoteCursor(socketId, userName, position, selection) {
     const editor = editorRef.current;
     if (!editor) return;
 
     const color = getCursorColor(socketId);
     injectCursorCSS(socketId, color);
 
-    const decoration = {
-      range: {
-        startLineNumber: position.lineNumber,
-        startColumn: 1,
-        endLineNumber: position.lineNumber,
-        endColumn: 1,
-      },
-      options: {
-        isWholeLine: true,
-        className: `rcursor-${socketId}`,
-        overviewRuler: { color },
-      },
+    // 1. Line highlight decoration
+    const lineDecoration = {
+      range: { startLineNumber: position.lineNumber, startColumn: 1, endLineNumber: position.lineNumber, endColumn: 1 },
+      options: { isWholeLine: true, className: `rcursor-${socketId}`, overviewRuler: { color } },
     };
-
-    const existing = decorationCollections.current.get(socketId);
-    if (existing) {
-      existing.set([decoration]);
+    const existingLine = decorationCollections.current.get(socketId);
+    if (existingLine) {
+      existingLine.set([lineDecoration]);
     } else {
-      decorationCollections.current.set(
-        socketId,
-        editor.createDecorationsCollection([decoration])
-      );
+      decorationCollections.current.set(socketId, editor.createDecorationsCollection([lineDecoration]));
+    }
+
+    // 2. Floating name label (content widget)
+    updateCursorWidget(socketId, userName, position.lineNumber);
+
+    // 3. Selection highlight (only when text is actually selected)
+    const existingSel = selectionCollections.current.get(socketId);
+    const hasSelection = selection &&
+      (selection.startLineNumber !== selection.endLineNumber || selection.startColumn !== selection.endColumn);
+
+    if (hasSelection) {
+      const selDecoration = {
+        range: selection,
+        options: { className: `rselection-${socketId}` },
+      };
+      if (existingSel) {
+        existingSel.set([selDecoration]);
+      } else {
+        selectionCollections.current.set(socketId, editor.createDecorationsCollection([selDecoration]));
+      }
+    } else if (existingSel) {
+      existingSel.clear();
     }
   }
 
   function clearRemoteCursor(socketId) {
-    const col = decorationCollections.current.get(socketId);
-    if (col) {
-      col.clear();
-      decorationCollections.current.delete(socketId);
-    }
+    decorationCollections.current.get(socketId)?.clear();
+    decorationCollections.current.delete(socketId);
+    selectionCollections.current.get(socketId)?.clear();
+    selectionCollections.current.delete(socketId);
+    const w = cursorWidgets.current.get(socketId);
+    if (w) editorRef.current?.removeContentWidget(w.widget);
+    cursorWidgets.current.delete(socketId);
     document.getElementById(`cstyle-${socketId}`)?.remove();
   }
 
-  async function loadRoom() {
+  async function loadRoom(password = null) {
     try {
-      const { data } = await api.get(`/api/v1/rooms/${roomId}`);
+      const params = password ? { password } : {};
+      const { data } = await api.get(`/api/v1/rooms/${roomId}`, { params });
       setRoom(data);
       setCode(data.content);
       setLanguage(data.language);
-    } catch {
-      alert("Room not found");
-      navigate("/dashboard");
+      setPasswordRequired(false);
+      setPasswordError("");
+      connectSocket();
+    } catch (err) {
+      if (err.response?.data?.requiresPassword) {
+        setPasswordRequired(true);
+      } else if (err.response?.status === 403) {
+        setPasswordError("Wrong password, try again");
+      } else {
+        alert("Room not found");
+        navigate("/dashboard");
+      }
     }
   }
 
   function connectSocket() {
+    if (socketSetup.current) return; // already connected
+    socketSetup.current = true;
+
     socket.connect();
     socket.emit("join-room", { roomId, userName: user?.name || "Anonymous" });
 
@@ -172,29 +243,22 @@ export default function RoomPage() {
     });
 
     socket.on("language-update", ({ language: lang }) => setLanguage(lang));
-
     socket.on("participants-update", (list) => setParticipants(list));
 
-    socket.on("user-joined", ({ userName }) => {
-      addToast(`${userName} joined`);
-    });
-
+    socket.on("user-joined", ({ userName }) => addToast(`${userName} joined`));
     socket.on("user-left", ({ userName, socketId }) => {
       addToast(`${userName} left`);
       clearRemoteCursor(socketId);
       setTypingUsers((prev) => prev.filter((u) => u !== userName));
     });
 
-    // Live cursors
-    socket.on("cursor-update", ({ socketId, position }) => {
-      updateRemoteCursor(socketId, position);
+    socket.on("cursor-update", ({ socketId, userName, position, selection }) => {
+      updateRemoteCursor(socketId, userName, position, selection);
     });
 
-    // Chat events
     socket.on("message-history", (msgs) => setMessages(msgs));
     socket.on("new-message", (msg) => setMessages((prev) => [...prev, msg]));
 
-    // Typing indicator
     socket.on("user-typing", ({ userName }) => {
       setTypingUsers((prev) => (prev.includes(userName) ? prev : [...prev, userName]));
     });
@@ -216,14 +280,24 @@ export default function RoomPage() {
     editorRef.current = editor;
     isRemoteChange.current = false;
 
-    // Throttled cursor position broadcast (max 20/s)
-    editor.onDidChangeCursorPosition((e) => {
+    // Track cursor AND selection changes, throttled to 20/s
+    editor.onDidChangeCursorSelection((e) => {
       const now = Date.now();
       if (now - lastCursorEmit.current < 50) return;
       lastCursorEmit.current = now;
+
+      const sel = e.selection;
+      const hasSelection = !(
+        sel.startLineNumber === sel.endLineNumber && sel.startColumn === sel.endColumn
+      );
+
       socket.emit("cursor-move", {
         roomId,
-        position: { lineNumber: e.position.lineNumber, column: e.position.column },
+        position: { lineNumber: sel.positionLineNumber, column: sel.positionColumn },
+        selection: hasSelection
+          ? { startLineNumber: sel.startLineNumber, startColumn: sel.startColumn,
+              endLineNumber: sel.endLineNumber, endColumn: sel.endColumn }
+          : null,
       });
     });
   }
@@ -242,12 +316,11 @@ export default function RoomPage() {
 
   function downloadCode() {
     const extensions = { javascript: "js", typescript: "ts", python: "py", java: "java", cpp: "cpp" };
-    const ext = extensions[language] || "txt";
     const blob = new Blob([code], { type: "text/plain" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `code.${ext}`;
+    a.download = `code.${extensions[language] || "txt"}`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -256,9 +329,7 @@ export default function RoomPage() {
     setNewMessage(e.target.value);
     socket.emit("typing-start", { roomId });
     clearTimeout(typingTimerRef.current);
-    typingTimerRef.current = setTimeout(() => {
-      socket.emit("typing-stop", { roomId });
-    }, 1500);
+    typingTimerRef.current = setTimeout(() => socket.emit("typing-stop", { roomId }), 1500);
   }
 
   function sendMessage(e) {
@@ -283,16 +354,52 @@ export default function RoomPage() {
     }
   }
 
+  // ── Password modal (full-screen block until correct password entered) ──────
+  if (passwordRequired) {
+    return (
+      <div className="min-h-screen bg-gray-950 flex items-center justify-center">
+        <div className="bg-gray-900 border border-gray-700 rounded-xl p-8 w-80 shadow-2xl">
+          <p className="text-2xl text-center mb-2">🔒</p>
+          <h3 className="text-white font-semibold text-center mb-1">Password required</h3>
+          <p className="text-gray-400 text-sm text-center mb-5">This room is password protected</p>
+          {passwordError && (
+            <p className="text-red-400 text-sm text-center mb-3">{passwordError}</p>
+          )}
+          <form onSubmit={(e) => { e.preventDefault(); loadRoom(roomPassword); }}>
+            <input
+              type="password"
+              value={roomPassword}
+              onChange={(e) => setRoomPassword(e.target.value)}
+              placeholder="Enter room password"
+              autoFocus
+              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2.5 text-white mb-3 focus:outline-none focus:border-blue-500"
+            />
+            <button
+              type="submit"
+              className="w-full bg-blue-600 hover:bg-blue-500 text-white py-2.5 rounded-lg font-medium transition"
+            >
+              Join Room
+            </button>
+          </form>
+          <button
+            onClick={() => navigate("/dashboard")}
+            className="mt-3 w-full text-gray-500 hover:text-gray-300 text-sm transition"
+          >
+            ← Back to dashboard
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Main editor UI ──────────────────────────────────────────────────────────
   return (
     <div className="h-screen flex flex-col bg-gray-950">
 
       {/* Toast notifications */}
       <div className="fixed top-4 right-4 z-50 flex flex-col gap-2 pointer-events-none">
         {toasts.map((t) => (
-          <div
-            key={t.id}
-            className="bg-gray-800 border border-gray-700 text-white text-sm px-4 py-2.5 rounded-lg shadow-xl"
-          >
+          <div key={t.id} className="bg-gray-800 border border-gray-700 text-white text-sm px-4 py-2.5 rounded-lg shadow-xl">
             {t.message}
           </div>
         ))}
@@ -301,29 +408,34 @@ export default function RoomPage() {
       {/* Top bar */}
       <div className="bg-gray-900 border-b border-gray-800 px-4 py-2 flex items-center justify-between flex-shrink-0">
         <div className="flex items-center gap-3">
-          <button
-            onClick={() => navigate("/dashboard")}
-            className="text-gray-400 hover:text-white text-sm transition"
-          >
+          <button onClick={() => navigate("/dashboard")} className="text-gray-400 hover:text-white text-sm transition">
             ← Back
           </button>
           <span className="text-white font-semibold">{room?.name || "Loading..."}</span>
-          <span className="text-gray-500 text-xs font-mono bg-gray-800 px-2 py-0.5 rounded">
-            #{roomId}
-          </span>
+          {room?.hasPassword && <span title="Password protected" className="text-gray-500 text-xs">🔒</span>}
+          <span className="text-gray-500 text-xs font-mono bg-gray-800 px-2 py-0.5 rounded">#{roomId}</span>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2">
+          {/* Language selector */}
           <select
             value={language}
             onChange={handleLanguageChange}
             className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1 text-sm text-white focus:outline-none focus:border-blue-500"
           >
-            {LANGUAGES.map((l) => (
-              <option key={l} value={l}>{l}</option>
-            ))}
+            {LANGUAGES.map((l) => <option key={l} value={l}>{l}</option>)}
           </select>
 
+          {/* Theme selector */}
+          <select
+            value={editorTheme}
+            onChange={(e) => setEditorTheme(e.target.value)}
+            className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1 text-sm text-white focus:outline-none focus:border-blue-500"
+          >
+            {THEMES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
+          </select>
+
+          {/* Run */}
           <button
             onClick={runCode}
             disabled={isRunning}
@@ -332,7 +444,7 @@ export default function RoomPage() {
             {isRunning ? "Running..." : "▶ Run"}
           </button>
 
-          {/* Participant avatars with online green dot */}
+          {/* Participant avatars with online dot */}
           <div className="flex -space-x-1">
             {participants.slice(0, 4).map((p) => (
               <div key={p.socketId} className="relative">
@@ -348,31 +460,20 @@ export default function RoomPage() {
             ))}
           </div>
 
-          {/* Download button */}
-          <button
-            onClick={downloadCode}
-            title="Download code"
-            className="bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-3 py-1 rounded-lg text-sm transition"
-          >
+          {/* Download */}
+          <button onClick={downloadCode} className="bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-3 py-1 rounded-lg text-sm transition">
             ⬇ Download
           </button>
 
-          {/* Share button — opens modal */}
-          <button
-            onClick={() => setShareOpen(true)}
-            className="bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-3 py-1 rounded-lg text-sm transition"
-          >
+          {/* Share */}
+          <button onClick={() => setShareOpen(true)} className="bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-3 py-1 rounded-lg text-sm transition">
             Share
           </button>
 
+          {/* Chat toggle */}
           <button
             onClick={() => setChatOpen((v) => !v)}
-            title="Toggle chat"
-            className={`px-3 py-1 rounded-lg text-sm transition ${
-              chatOpen
-                ? "bg-blue-600 text-white"
-                : "bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white"
-            }`}
+            className={`px-3 py-1 rounded-lg text-sm transition ${chatOpen ? "bg-blue-600 text-white" : "bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white"}`}
           >
             💬
           </button>
@@ -391,14 +492,8 @@ export default function RoomPage() {
               value={code}
               onChange={handleCodeChange}
               onMount={handleEditorMount}
-              theme="vs-dark"
-              options={{
-                fontSize: 14,
-                minimap: { enabled: false },
-                scrollBeyondLastLine: false,
-                wordWrap: "on",
-                tabSize: 2,
-              }}
+              theme={editorTheme}
+              options={{ fontSize: 14, minimap: { enabled: false }, scrollBeyondLastLine: false, wordWrap: "on", tabSize: 2 }}
             />
           </div>
 
@@ -406,12 +501,7 @@ export default function RoomPage() {
             <div className="h-40 border-t border-gray-800 bg-gray-950 flex flex-col flex-shrink-0">
               <div className="flex items-center justify-between px-4 py-1.5 border-b border-gray-800">
                 <span className="text-gray-400 text-xs font-mono font-semibold tracking-widest">OUTPUT</span>
-                <button
-                  onClick={() => setRunOutput(null)}
-                  className="text-gray-600 hover:text-gray-300 text-xs transition"
-                >
-                  ✕ close
-                </button>
+                <button onClick={() => setRunOutput(null)} className="text-gray-600 hover:text-gray-300 text-xs transition">✕ close</button>
               </div>
               <div className="flex-1 overflow-y-auto px-4 py-2">
                 <pre className="text-green-400 text-sm font-mono whitespace-pre-wrap">{runOutput}</pre>
@@ -425,18 +515,10 @@ export default function RoomPage() {
           <div className="w-72 border-l border-gray-800 flex flex-col bg-gray-900 flex-shrink-0">
             <div className="px-4 py-2.5 border-b border-gray-800 flex items-center justify-between">
               <span className="text-white text-sm font-semibold">Chat</span>
-              <button
-                onClick={() => setChatOpen(false)}
-                className="text-gray-500 hover:text-gray-300 text-xs transition"
-              >
-                ✕
-              </button>
+              <button onClick={() => setChatOpen(false)} className="text-gray-500 hover:text-gray-300 text-xs transition">✕</button>
             </div>
-
             <div className="flex-1 overflow-y-auto p-3 space-y-3">
-              {messages.length === 0 && (
-                <p className="text-gray-600 text-xs text-center mt-4">No messages yet</p>
-              )}
+              {messages.length === 0 && <p className="text-gray-600 text-xs text-center mt-4">No messages yet</p>}
               {messages.map((msg) => (
                 <div key={msg._id}>
                   <div className="flex items-baseline gap-1.5">
@@ -450,8 +532,6 @@ export default function RoomPage() {
               ))}
               <div ref={chatEndRef} />
             </div>
-
-            {/* Typing indicator */}
             <div className="px-3 h-5 flex items-center">
               {typingUsers.length > 0 && (
                 <p className="text-gray-500 text-xs italic">
@@ -459,7 +539,6 @@ export default function RoomPage() {
                 </p>
               )}
             </div>
-
             <form onSubmit={sendMessage} className="p-3 border-t border-gray-800">
               <div className="flex gap-2">
                 <input
@@ -468,11 +547,7 @@ export default function RoomPage() {
                   placeholder="Send a message..."
                   className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
                 />
-                <button
-                  type="submit"
-                  disabled={!newMessage.trim()}
-                  className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white px-3 py-1.5 rounded-lg text-sm transition"
-                >
+                <button type="submit" disabled={!newMessage.trim()} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white px-3 py-1.5 rounded-lg text-sm transition">
                   Send
                 </button>
               </div>
@@ -489,36 +564,22 @@ export default function RoomPage() {
 
       {/* Share modal */}
       {shareOpen && (
-        <div
-          className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center"
-          onClick={() => setShareOpen(false)}
-        >
-          <div
-            className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-96 shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center" onClick={() => setShareOpen(false)}>
+          <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-96 shadow-2xl" onClick={(e) => e.stopPropagation()}>
             <h3 className="text-white font-semibold mb-1">Invite collaborators</h3>
-            <p className="text-gray-400 text-sm mb-4">
-              Share this link — anyone with it can join the room
-            </p>
+            <p className="text-gray-400 text-sm mb-4">Share this link — anyone with it can join the room</p>
             <div className="flex gap-2">
               <input
                 readOnly
                 value={window.location.href}
-                className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none select-all"
                 onFocus={(e) => e.target.select()}
+                className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none"
               />
-              <button
-                onClick={copyShareLink}
-                className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition"
-              >
+              <button onClick={copyShareLink} className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition">
                 {copied ? "✓" : "Copy"}
               </button>
             </div>
-            <button
-              onClick={() => setShareOpen(false)}
-              className="mt-4 w-full text-gray-500 hover:text-gray-300 text-sm transition"
-            >
+            <button onClick={() => setShareOpen(false)} className="mt-4 w-full text-gray-500 hover:text-gray-300 text-sm transition">
               Close
             </button>
           </div>
