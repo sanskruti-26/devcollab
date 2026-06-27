@@ -3,6 +3,7 @@ const router = require("express").Router();
 const bcrypt = require("bcryptjs");
 const auth = require("../middleware/auth");
 const Room = require("../models/Room");
+const Snapshot = require("../models/Snapshot");
 
 // Helper — strips the password hash and adds hasPassword boolean
 function safeRoom(room) {
@@ -42,6 +43,31 @@ router.post("/", auth, async (req, res) => {
       password: hashedPassword,
     });
     res.status(201).json(safeRoom(room));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/v1/rooms/:roomId/replay — ordered snapshots for session replay
+// Same access control as GET /:roomId (password-protected rooms require ?password=)
+router.get("/:roomId/replay", auth, async (req, res) => {
+  try {
+    const room = await Room.findOne({ roomId: req.params.roomId });
+    if (!room) return res.status(404).json({ error: "Room not found" });
+
+    if (room.password && room.owner.toString() !== req.user.id) {
+      const provided = req.query.password;
+      if (!provided) return res.status(403).json({ requiresPassword: true });
+      const valid = await bcrypt.compare(provided, room.password);
+      if (!valid) return res.status(403).json({ error: "Wrong password" });
+    }
+
+    const snapshots = await Snapshot.find({ roomId: req.params.roomId })
+      .sort({ createdAt: 1 })
+      .select("content userName createdAt")
+      .limit(500); // cap at 500 frames — enough for any session
+
+    res.json(snapshots);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -74,6 +74,13 @@ export default function RoomPage() {
   const [runOutput, setRunOutput] = useState(null);  // { output, by } | null
   const [runningBy, setRunningBy] = useState(null);  // name of whoever clicked Run
 
+  // Session replay
+  const [replayMode, setReplayMode] = useState(false);
+  const [replaySnapshots, setReplaySnapshots] = useState([]);
+  const [replayIndex, setReplayIndex] = useState(0);
+  const [replayPlaying, setReplayPlaying] = useState(false);
+  const [replayLoading, setReplayLoading] = useState(false);
+
   // Toasts
   const [toasts, setToasts] = useState([]);
 
@@ -86,6 +93,7 @@ export default function RoomPage() {
   const decorationCollections = useRef(new Map()); // socketId -> line highlight collection
   const selectionCollections = useRef(new Map());  // socketId -> selection highlight collection
   const cursorWidgets = useRef(new Map());         // socketId -> { widget, domNode }
+  const replayTimerRef = useRef(null);             // setInterval handle for auto-play
 
   useEffect(() => {
     loadRoom();
@@ -94,6 +102,7 @@ export default function RoomPage() {
       socket.disconnect();
       socketSetup.current = false;
       clearTimeout(typingTimerRef.current);
+      clearInterval(replayTimerRef.current);
       decorationCollections.current.forEach((c) => c.clear());
       decorationCollections.current.clear();
       selectionCollections.current.forEach((c) => c.clear());
@@ -414,6 +423,52 @@ export default function RoomPage() {
     }
   }
 
+  // ── Session replay ─────────────────────────────────────────────────────────
+
+  async function openReplay() {
+    setReplayLoading(true);
+    try {
+      const { data } = await api.get(`/api/v1/rooms/${roomId}/replay`);
+      if (!data.length) {
+        addToast("No replay data yet — edit some code first");
+        return;
+      }
+      setReplaySnapshots(data);
+      setReplayIndex(0);
+      setReplayMode(true);
+    } catch {
+      addToast("Could not load replay");
+    } finally {
+      setReplayLoading(false);
+    }
+  }
+
+  function closeReplay() {
+    clearInterval(replayTimerRef.current);
+    setReplayMode(false);
+    setReplayPlaying(false);
+    setReplaySnapshots([]);
+  }
+
+  function togglePlay(snapshots) {
+    if (replayPlaying) {
+      clearInterval(replayTimerRef.current);
+      setReplayPlaying(false);
+      return;
+    }
+    setReplayPlaying(true);
+    replayTimerRef.current = setInterval(() => {
+      setReplayIndex((prev) => {
+        if (prev >= snapshots.length - 1) {
+          clearInterval(replayTimerRef.current);
+          setReplayPlaying(false);
+          return prev;
+        }
+        return prev + 1;
+      });
+    }, 750);
+  }
+
   // ── Password modal (full-screen block until correct password entered) ──────
   if (passwordRequired) {
     return (
@@ -530,6 +585,17 @@ export default function RoomPage() {
             Share
           </button>
 
+          {/* Replay */}
+          {!replayMode && (
+            <button
+              onClick={openReplay}
+              disabled={replayLoading}
+              className="bg-purple-700 hover:bg-purple-600 disabled:opacity-50 text-white px-3 py-1 rounded-lg text-sm font-medium transition"
+            >
+              {replayLoading ? "Loading..." : "⏪ Replay"}
+            </button>
+          )}
+
           {/* Chat toggle */}
           <button
             onClick={() => setChatOpen((v) => !v)}
@@ -543,51 +609,137 @@ export default function RoomPage() {
       {/* Main content */}
       <div className="flex-1 flex overflow-hidden">
 
-        {/* Editor + output */}
+        {/* Editor + output  OR  Replay panel */}
         <div className="flex-1 flex flex-col overflow-hidden">
-          <div className="flex-1 overflow-hidden">
-            <Editor
-              height="100%"
-              language={MONACO_LANG[language] || "javascript"}
-              value={code}
-              onChange={handleCodeChange}
-              onMount={handleEditorMount}
-              theme={editorTheme}
-              options={{ fontSize: 14, minimap: { enabled: false }, scrollBeyondLastLine: false, wordWrap: "on", tabSize: 2 }}
-            />
-          </div>
-
-          {(runOutput !== null || runningBy !== null) && (
-            <div className="h-40 border-t border-gray-800 bg-gray-950 flex flex-col flex-shrink-0">
-              <div className="flex items-center justify-between px-4 py-1.5 border-b border-gray-800">
-                <div className="flex items-center gap-2">
-                  <span className="text-gray-400 text-xs font-mono font-semibold tracking-widest">OUTPUT</span>
-                  {runOutput?.by && (
-                    <span className="text-gray-400 text-xs">· ran by {runOutput.by}</span>
-                  )}
+          {replayMode ? (
+            /* ── Replay panel ─────────────────────────────────────────── */
+            <>
+              {/* Replay header */}
+              <div className="bg-gray-900 border-b border-gray-800 px-4 py-2 flex items-center justify-between flex-shrink-0">
+                <div className="flex items-center gap-3">
+                  <span className="text-purple-400 text-sm font-semibold">⏪ Replay</span>
+                  <span className="text-white text-sm">{replaySnapshots[replayIndex]?.userName}</span>
+                  <span className="text-gray-500 text-xs">
+                    {new Date(replaySnapshots[replayIndex]?.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                  </span>
+                  <span className="text-gray-600 text-xs font-mono">
+                    {replayIndex + 1} / {replaySnapshots.length}
+                  </span>
                 </div>
                 <button
-                  onClick={() => { setRunOutput(null); setRunningBy(null); }}
-                  className="text-gray-600 hover:text-gray-300 text-xs transition"
+                  onClick={closeReplay}
+                  className="bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-3 py-1 rounded-lg text-sm transition"
                 >
-                  ✕ close
+                  ✕ Exit Replay
                 </button>
               </div>
-              <div className="flex-1 overflow-y-auto px-4 py-2">
-                {runningBy ? (
-                  <div>
-                    <p className="text-yellow-400 text-sm font-mono italic">
-                      {runningBy} is running the code...
-                    </p>
-                    {runOutput?.output && (
-                      <p className="text-gray-500 text-xs font-mono mt-1">{runOutput.output}</p>
+
+              {/* Read-only editor showing the snapshot at current index */}
+              <div className="flex-1 overflow-hidden">
+                <Editor
+                  key="replay"
+                  height="100%"
+                  language={MONACO_LANG[language] || "javascript"}
+                  value={replaySnapshots[replayIndex]?.content || ""}
+                  theme={editorTheme}
+                  options={{ fontSize: 14, minimap: { enabled: false }, readOnly: true, scrollBeyondLastLine: false, wordWrap: "on", tabSize: 2 }}
+                />
+              </div>
+
+              {/* Timeline controls */}
+              <div className="bg-gray-900 border-t border-gray-800 px-4 pt-3 pb-2 flex-shrink-0">
+                <input
+                  type="range"
+                  min={0}
+                  max={Math.max(replaySnapshots.length - 1, 1)}
+                  value={replayIndex}
+                  onChange={(e) => {
+                    clearInterval(replayTimerRef.current);
+                    setReplayPlaying(false);
+                    setReplayIndex(Number(e.target.value));
+                  }}
+                  className="w-full mb-2 accent-purple-500 cursor-pointer"
+                />
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    {/* Jump to start */}
+                    <button
+                      onClick={() => { clearInterval(replayTimerRef.current); setReplayPlaying(false); setReplayIndex(0); }}
+                      className="bg-gray-800 hover:bg-gray-700 text-gray-300 px-2 py-1 rounded text-sm transition"
+                      title="Jump to start"
+                    >⏮</button>
+
+                    {/* Play / Pause */}
+                    <button
+                      onClick={() => togglePlay(replaySnapshots)}
+                      className="bg-purple-600 hover:bg-purple-500 text-white px-4 py-1 rounded-lg text-sm font-medium transition"
+                    >
+                      {replayPlaying ? "⏸ Pause" : "▶ Play"}
+                    </button>
+
+                    {/* Jump to end */}
+                    <button
+                      onClick={() => { clearInterval(replayTimerRef.current); setReplayPlaying(false); setReplayIndex(replaySnapshots.length - 1); }}
+                      className="bg-gray-800 hover:bg-gray-700 text-gray-300 px-2 py-1 rounded text-sm transition"
+                      title="Jump to end"
+                    >⏭</button>
+                  </div>
+                  <span className="text-gray-600 text-xs">
+                    {new Date(replaySnapshots[0]?.createdAt).toLocaleDateString([], { month: "short", day: "numeric" })}
+                    {" · "}{replaySnapshots.length} snapshots
+                  </span>
+                </div>
+              </div>
+            </>
+          ) : (
+            /* ── Live editor ───────────────────────────────────────────── */
+            <>
+              <div className="flex-1 overflow-hidden">
+                <Editor
+                  key="live"
+                  height="100%"
+                  language={MONACO_LANG[language] || "javascript"}
+                  value={code}
+                  onChange={handleCodeChange}
+                  onMount={handleEditorMount}
+                  theme={editorTheme}
+                  options={{ fontSize: 14, minimap: { enabled: false }, scrollBeyondLastLine: false, wordWrap: "on", tabSize: 2 }}
+                />
+              </div>
+
+              {(runOutput !== null || runningBy !== null) && (
+                <div className="h-40 border-t border-gray-800 bg-gray-950 flex flex-col flex-shrink-0">
+                  <div className="flex items-center justify-between px-4 py-1.5 border-b border-gray-800">
+                    <div className="flex items-center gap-2">
+                      <span className="text-gray-400 text-xs font-mono font-semibold tracking-widest">OUTPUT</span>
+                      {runOutput?.by && (
+                        <span className="text-gray-400 text-xs">· ran by {runOutput.by}</span>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => { setRunOutput(null); setRunningBy(null); }}
+                      className="text-gray-600 hover:text-gray-300 text-xs transition"
+                    >
+                      ✕ close
+                    </button>
+                  </div>
+                  <div className="flex-1 overflow-y-auto px-4 py-2">
+                    {runningBy ? (
+                      <div>
+                        <p className="text-yellow-400 text-sm font-mono italic">
+                          {runningBy} is running the code...
+                        </p>
+                        {runOutput?.output && (
+                          <p className="text-gray-500 text-xs font-mono mt-1">{runOutput.output}</p>
+                        )}
+                      </div>
+                    ) : (
+                      <pre className="text-green-400 text-sm font-mono whitespace-pre-wrap">{runOutput?.output}</pre>
                     )}
                   </div>
-                ) : (
-                  <pre className="text-green-400 text-sm font-mono whitespace-pre-wrap">{runOutput?.output}</pre>
-                )}
-              </div>
-            </div>
+                </div>
+              )}
+            </>
           )}
         </div>
 
