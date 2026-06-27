@@ -6,6 +6,14 @@ import { useAuth } from "../hooks/useAuth";
 
 const LANGUAGES = ["javascript", "typescript", "python", "java", "cpp"];
 
+const LANG_BADGE = {
+  javascript: "bg-yellow-500/20 text-yellow-400 border border-yellow-500/30",
+  typescript: "bg-blue-500/20 text-blue-400 border border-blue-500/30",
+  python:     "bg-green-500/20 text-green-400 border border-green-500/30",
+  java:       "bg-orange-500/20 text-orange-400 border border-orange-500/30",
+  cpp:        "bg-purple-500/20 text-purple-400 border border-purple-500/30",
+};
+
 export default function DashboardPage() {
   const navigate = useNavigate();
   const { user, logout } = useAuth();
@@ -137,9 +145,14 @@ export default function DashboardPage() {
               >
                 <div>
                   <h3 className="text-white font-semibold">{room.name}</h3>
-                  <p className="text-gray-400 text-sm mt-0.5">
-                    {room.language} · Updated {new Date(room.updatedAt).toLocaleDateString()}
-                  </p>
+                  <div className="flex items-center gap-2 mt-1">
+                    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${LANG_BADGE[room.language] || "bg-gray-700 text-gray-400"}`}>
+                      {room.language}
+                    </span>
+                    <span className="text-gray-500 text-xs">
+                      Updated {new Date(room.updatedAt).toLocaleDateString()}
+                    </span>
+                  </div>
                 </div>
                 <div className="flex items-center gap-2">
                   <button
