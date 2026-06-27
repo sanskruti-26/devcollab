@@ -11,12 +11,17 @@
 
 const Room = require("../models/Room");
 const Message = require("../models/Message");
+const Snapshot = require("../models/Snapshot");
 
 // In-memory map: roomId -> latest code (for fast reads between DB saves)
 const roomCodeCache = new Map();
 
 // Debounce timers for auto-save: roomId -> setTimeout handle
 const saveTimers = new Map();
+
+// Debounce timers for replay snapshots: roomId -> setTimeout handle
+// Throttled to one snapshot per 2 seconds so we don't flood the DB
+const snapshotTimers = new Map();
 
 function setupSocketHandlers(io) {
   io.on("connection", (socket) => {
@@ -95,6 +100,19 @@ function setupSocketHandlers(io) {
           }
         }, 5000)
       );
+
+      // Debounced snapshot for session replay — at most one per 2 seconds per room
+      if (snapshotTimers.has(roomId)) clearTimeout(snapshotTimers.get(roomId));
+      snapshotTimers.set(
+        roomId,
+        setTimeout(async () => {
+          try {
+            await Snapshot.create({ roomId, content: code, userName: socket.userName });
+          } catch (err) {
+            console.error("Snapshot error:", err.message);
+          }
+        }, 2000)
+      );
     });
 
     // User changed the language
@@ -142,6 +160,16 @@ function setupSocketHandlers(io) {
         position,
         selection: selection || null,
       });
+    });
+
+    // Someone clicked Run — tell everyone so they see the loading state
+    socket.on("run-start", ({ roomId, runnerName }) => {
+      io.to(roomId).emit("run-start", { runnerName });
+    });
+
+    // Execution finished — broadcast result to everyone in the room
+    socket.on("run-result", ({ roomId, output, runnerName }) => {
+      io.to(roomId).emit("run-result", { output, runnerName });
     });
 
     // User started typing in chat
