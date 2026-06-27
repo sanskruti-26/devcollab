@@ -20,7 +20,7 @@ export default function DashboardPage() {
   const [rooms, setRooms] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showCreate, setShowCreate] = useState(false);
-  const [newRoom, setNewRoom] = useState({ name: "", language: "javascript" });
+  const [newRoom, setNewRoom] = useState({ name: "", language: "javascript", password: "" });
   const [creating, setCreating] = useState(false);
 
   useEffect(() => {
@@ -117,6 +117,16 @@ export default function DashboardPage() {
                   ))}
                 </select>
               </div>
+              <div>
+                <label className="block text-sm text-gray-400 mb-1">Password <span className="text-gray-600">(optional)</span></label>
+                <input
+                  type="password"
+                  value={newRoom.password}
+                  onChange={(e) => setNewRoom({ ...newRoom, password: e.target.value })}
+                  placeholder="Leave blank for public"
+                  className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
+                />
+              </div>
               <button
                 type="submit"
                 disabled={creating}
@@ -144,7 +154,10 @@ export default function DashboardPage() {
                 className="bg-gray-900 border border-gray-800 rounded-xl px-5 py-4 flex items-center justify-between hover:border-gray-600 transition"
               >
                 <div>
+                  <div className="flex items-center gap-2">
                   <h3 className="text-white font-semibold">{room.name}</h3>
+                  {room.hasPassword && <span title="Password protected" className="text-gray-500 text-xs">🔒</span>}
+                </div>
                   <div className="flex items-center gap-2 mt-1">
                     <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${LANG_BADGE[room.language] || "bg-gray-700 text-gray-400"}`}>
                       {room.language}

@@ -1,7 +1,16 @@
 // routes/rooms.js — CRUD for rooms, all protected by JWT
 const router = require("express").Router();
+const bcrypt = require("bcryptjs");
 const auth = require("../middleware/auth");
 const Room = require("../models/Room");
+
+// Helper — strips the password hash and adds hasPassword boolean
+function safeRoom(room) {
+  const obj = room.toObject ? room.toObject() : { ...room };
+  obj.hasPassword = !!obj.password;
+  delete obj.password;
+  return obj;
+}
 
 // GET /api/v1/rooms — list rooms the logged-in user owns or has joined
 router.get("/", auth, async (req, res) => {
@@ -10,36 +19,48 @@ router.get("/", auth, async (req, res) => {
       $or: [{ owner: req.user.id }, { participants: req.user.id }],
     })
       .sort({ updatedAt: -1 })
-      .select("roomId name language owner updatedAt");
-    res.json(rooms);
+      .select("roomId name language owner updatedAt password");
+    res.json(rooms.map(safeRoom));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/v1/rooms — create a new room
+// POST /api/v1/rooms — create a new room (optional password)
 router.post("/", auth, async (req, res) => {
   try {
-    const { name, language } = req.body;
+    const { name, language, password } = req.body;
     if (!name) return res.status(400).json({ error: "Room name required" });
+
+    const hashedPassword = password?.trim() ? await bcrypt.hash(password.trim(), 10) : null;
 
     const room = await Room.create({
       name,
       language: language || "javascript",
       owner: req.user.id,
       participants: [req.user.id],
+      password: hashedPassword,
     });
-    res.status(201).json(room);
+    res.status(201).json(safeRoom(room));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // GET /api/v1/rooms/:roomId — get a single room by its short ID
+// If the room has a password, the caller must pass ?password=xxx
 router.get("/:roomId", auth, async (req, res) => {
   try {
     const room = await Room.findOne({ roomId: req.params.roomId });
     if (!room) return res.status(404).json({ error: "Room not found" });
+
+    // Password check — owners bypass it
+    if (room.password && room.owner.toString() !== req.user.id) {
+      const provided = req.query.password;
+      if (!provided) return res.status(403).json({ requiresPassword: true });
+      const valid = await bcrypt.compare(provided, room.password);
+      if (!valid) return res.status(403).json({ error: "Wrong password" });
+    }
 
     // Add user to participants if not already there
     if (!room.participants.includes(req.user.id)) {
@@ -47,7 +68,7 @@ router.get("/:roomId", auth, async (req, res) => {
       await room.save();
     }
 
-    res.json(room);
+    res.json(safeRoom(room));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

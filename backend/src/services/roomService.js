@@ -134,12 +134,13 @@ function setupSocketHandlers(io) {
       }
     });
 
-    // User moved cursor in the editor — broadcast position to others
-    socket.on("cursor-move", ({ roomId, position }) => {
+    // User moved cursor or changed selection — broadcast to others
+    socket.on("cursor-move", ({ roomId, position, selection }) => {
       socket.to(roomId).emit("cursor-update", {
         socketId: socket.id,
         userName: socket.userName,
         position,
+        selection: selection || null,
       });
     });
 
