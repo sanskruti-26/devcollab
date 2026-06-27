@@ -360,20 +360,54 @@ export default function RoomPage() {
     if (runningBy) return; // block if someone is already running
     const name = user?.name || "Anonymous";
 
-    // Update local state immediately so the runner sees the panel right away
-    // (don't wait for the server echo — that's only needed for other users)
+    // Show "running" immediately on the runner's tab; broadcast to others via socket
     setRunningBy(name);
     setRunOutput(null);
     socket.emit("run-start", { roomId, runnerName: name });
 
-    try {
+    // Calls the execute API and returns the output string
+    async function attempt() {
       const { data } = await api.post("/api/v1/rooms/execute", { code, language });
-      const output = data.output || "(no output)";
+      return data.output || "(no output)";
+    }
+
+    try {
+      let output;
+      try {
+        output = await attempt();
+      } catch (firstErr) {
+        // 503 with JUDGE0_KEY message = config error, no point retrying
+        const is503NoKey = firstErr.response?.status === 503 &&
+          firstErr.response?.data?.error?.includes("JUDGE0_KEY");
+        const isRetryable = !is503NoKey &&
+          (!firstErr.response || firstErr.response.status >= 500);
+
+        if (!isRetryable) throw firstErr;
+
+        // Likely Render cold start — show hint as a subtitle under "running..."
+        // then retry once after 3 s (by then Render should be awake)
+        setRunOutput({ output: "Server is waking up — retrying in 3 seconds...", by: name });
+        await new Promise((r) => setTimeout(r, 3000));
+        setRunOutput(null);
+        output = await attempt(); // throws if retry also fails → caught below
+      }
+
       setRunningBy(null);
       setRunOutput({ output, by: name });
       socket.emit("run-result", { roomId, output, runnerName: name });
     } catch (err) {
-      const output = `Error: ${err.response?.data?.error || err.message}`;
+      const status = err.response?.status;
+      const serverMsg = err.response?.data?.error || "";
+
+      let output;
+      if (status === 503 && serverMsg.includes("JUDGE0_KEY")) {
+        output = "Code execution not configured — add JUDGE0_KEY to backend/.env";
+      } else if (!err.response) {
+        output = "Server is not responding. Try again in a moment.";
+      } else {
+        output = serverMsg || err.message || "Execution failed";
+      }
+
       setRunningBy(null);
       setRunOutput({ output, by: name });
       socket.emit("run-result", { roomId, output, runnerName: name });
@@ -529,7 +563,7 @@ export default function RoomPage() {
                 <div className="flex items-center gap-2">
                   <span className="text-gray-400 text-xs font-mono font-semibold tracking-widest">OUTPUT</span>
                   {runOutput?.by && (
-                    <span className="text-gray-600 text-xs">· ran by {runOutput.by}</span>
+                    <span className="text-gray-400 text-xs">· ran by {runOutput.by}</span>
                   )}
                 </div>
                 <button
@@ -541,9 +575,14 @@ export default function RoomPage() {
               </div>
               <div className="flex-1 overflow-y-auto px-4 py-2">
                 {runningBy ? (
-                  <p className="text-yellow-400 text-sm font-mono italic">
-                    {runningBy} is running the code...
-                  </p>
+                  <div>
+                    <p className="text-yellow-400 text-sm font-mono italic">
+                      {runningBy} is running the code...
+                    </p>
+                    {runOutput?.output && (
+                      <p className="text-gray-500 text-xs font-mono mt-1">{runOutput.output}</p>
+                    )}
+                  </div>
                 ) : (
                   <pre className="text-green-400 text-sm font-mono whitespace-pre-wrap">{runOutput?.output}</pre>
                 )}
