@@ -49,26 +49,31 @@ router.post("/", auth, async (req, res) => {
 });
 
 // GET /api/v1/rooms/:roomId/replay — ordered snapshots for session replay
-// Same access control as GET /:roomId (password-protected rooms require ?password=)
+// Access: owner always allowed. For password-protected rooms, participant membership
+// is used as proof of prior access — the user already verified the password when
+// they joined, so we don't ask for it again here.
 router.get("/:roomId/replay", auth, async (req, res) => {
   try {
     const room = await Room.findOne({ roomId: req.params.roomId });
     if (!room) return res.status(404).json({ error: "Room not found" });
 
-    if (room.password && room.owner.toString() !== req.user.id) {
-      const provided = req.query.password;
-      if (!provided) return res.status(403).json({ requiresPassword: true });
-      const valid = await bcrypt.compare(provided, room.password);
-      if (!valid) return res.status(403).json({ error: "Wrong password" });
+    const isOwner = room.owner.toString() === req.user.id;
+    const isParticipant = room.participants.some((p) => p.toString() === req.user.id);
+
+    if (room.password && !isOwner && !isParticipant) {
+      // User has never verified the room password — deny access
+      return res.status(403).json({ requiresPassword: true });
     }
 
     const snapshots = await Snapshot.find({ roomId: req.params.roomId })
       .sort({ createdAt: 1 })
       .select("content userName createdAt")
-      .limit(500); // cap at 500 frames — enough for any session
+      .limit(500);
 
+    console.log(`Replay: room=${req.params.roomId} user=${req.user.id} snapshots=${snapshots.length}`);
     res.json(snapshots);
   } catch (err) {
+    console.error("Replay error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });

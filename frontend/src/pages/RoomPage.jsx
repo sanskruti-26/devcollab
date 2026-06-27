@@ -427,8 +427,10 @@ export default function RoomPage() {
 
   async function openReplay() {
     setReplayLoading(true);
+    console.log(`[Replay] fetching room=${roomId}`);
     try {
       const { data } = await api.get(`/api/v1/rooms/${roomId}/replay`);
+      console.log(`[Replay] loaded ${data.length} snapshots`);
       if (!data.length) {
         addToast("No replay data yet — edit some code first");
         return;
@@ -436,8 +438,11 @@ export default function RoomPage() {
       setReplaySnapshots(data);
       setReplayIndex(0);
       setReplayMode(true);
-    } catch {
-      addToast("Could not load replay");
+    } catch (err) {
+      const status = err.response?.status;
+      const msg = err.response?.data?.error || err.message;
+      console.error(`[Replay] failed — status=${status} msg=${msg}`);
+      addToast(status === 403 ? "Access denied for replay" : `Could not load replay (${status ?? "network error"})`);
     } finally {
       setReplayLoading(false);
     }
