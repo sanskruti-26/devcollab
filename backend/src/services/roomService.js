@@ -134,12 +134,34 @@ function setupSocketHandlers(io) {
       }
     });
 
+    // User moved cursor in the editor — broadcast position to others
+    socket.on("cursor-move", ({ roomId, position }) => {
+      socket.to(roomId).emit("cursor-update", {
+        socketId: socket.id,
+        userName: socket.userName,
+        position,
+      });
+    });
+
+    // User started typing in chat
+    socket.on("typing-start", ({ roomId }) => {
+      socket.to(roomId).emit("user-typing", { userName: socket.userName });
+    });
+
+    // User stopped typing in chat
+    socket.on("typing-stop", ({ roomId }) => {
+      socket.to(roomId).emit("user-stopped-typing", { userName: socket.userName });
+    });
+
     // User disconnected
     socket.on("disconnect", async () => {
       console.log(`Socket disconnected: ${socket.id}`);
       if (!socket.roomId) return;
 
       const roomId = socket.roomId;
+
+      // Clear their typing indicator for others
+      socket.to(roomId).emit("user-stopped-typing", { userName: socket.userName });
 
       // Tell everyone else they left
       io.to(roomId).emit("user-left", {
