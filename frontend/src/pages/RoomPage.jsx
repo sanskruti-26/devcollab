@@ -1,7 +1,10 @@
 // pages/RoomPage.jsx — collaborative editor with multi-file support
+// Sync engine: Yjs CRDT over Socket.io (y-monaco binding per file)
 import { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import Editor from "@monaco-editor/react";
+import * as Y from "yjs";
+import { MonacoBinding } from "y-monaco";
 import api from "../lib/api";
 import socket from "../lib/socket";
 import { useAuth } from "../hooks/useAuth";
@@ -16,7 +19,6 @@ const MONACO_LANG = {
   cpp: "cpp",
 };
 
-// Short text badge shown in the file sidebar next to each filename
 const FILE_ICONS = {
   javascript: "JS",
   typescript: "TS",
@@ -61,7 +63,6 @@ export default function RoomPage() {
 
   // ── Room & editor core ────────────────────────────────────────────────────
   const [room, setRoom]             = useState(null);
-  const [code, setCode]             = useState("// Loading...");
   const [language, setLanguage]     = useState("javascript");
   const [editorTheme, setEditorTheme] = useState("vs-dark");
   const [participants, setParticipants] = useState([]);
@@ -75,12 +76,11 @@ export default function RoomPage() {
 
   // ── Multi-file ────────────────────────────────────────────────────────────
   const [files, setFiles]               = useState([]);
-  const [activeFile, setActiveFile]     = useState(null);  // full file object
-  const [filePresence, setFilePresence] = useState([]);    // [{socketId,userName,activeFileId}]
-  // Sidebar UI state
+  const [activeFile, setActiveFile]     = useState(null);
+  const [filePresence, setFilePresence] = useState([]);
   const [addingFile, setAddingFile]   = useState(false);
   const [newFileName, setNewFileName] = useState("");
-  const [renaming, setRenaming]       = useState(null);    // {fileId,name} | null
+  const [renaming, setRenaming]       = useState(null);
 
   // ── Chat ──────────────────────────────────────────────────────────────────
   const [chatOpen, setChatOpen]       = useState(false);
@@ -89,8 +89,8 @@ export default function RoomPage() {
   const [typingUsers, setTypingUsers] = useState([]);
 
   // ── Code execution ────────────────────────────────────────────────────────
-  const [runOutput, setRunOutput]   = useState(null);   // {output,by} | null
-  const [runningBy, setRunningBy]   = useState(null);   // name of runner
+  const [runOutput, setRunOutput]   = useState(null);
+  const [runningBy, setRunningBy]   = useState(null);
 
   // ── Session replay ────────────────────────────────────────────────────────
   const [replayMode, setReplayMode]           = useState(false);
@@ -103,7 +103,6 @@ export default function RoomPage() {
   const [toasts, setToasts] = useState([]);
 
   // ── Refs ──────────────────────────────────────────────────────────────────
-  const isRemoteChange    = useRef(false);
   const editorRef         = useRef(null);
   const chatEndRef        = useRef(null);
   const typingTimerRef    = useRef(null);
@@ -114,13 +113,14 @@ export default function RoomPage() {
   const cursorWidgets     = useRef(new Map());
   const replayTimerRef    = useRef(null);
 
+  // Yjs: one Y.Doc + MonacoBinding per active file. Destroyed + recreated on file switch.
+  const ydocRef    = useRef(null);
+  const bindingRef = useRef(null);
+
   // Kept in sync with state so socket event handlers (set up once) never go stale
   const activeFileIdRef = useRef(null);
   const filesRef        = useRef([]);
-  // Per-file content cache — enables instant display when switching back to a file
-  const fileCache = useRef(new Map());
 
-  // Keep refs in sync with state
   useEffect(() => { activeFileIdRef.current = activeFile?._id || null; }, [activeFile]);
   useEffect(() => { filesRef.current = files; },                        [files]);
 
@@ -128,10 +128,19 @@ export default function RoomPage() {
     loadRoom();
     return () => {
       socket.emit("leave-room", { roomId });
+      // Remove all listeners BEFORE disconnecting so that a remount (React
+      // Strict Mode or navigation back) starts with a clean slate. Without
+      // this, the singleton socket accumulates duplicate listeners on every
+      // remount, and each incoming yjs-update would be applied N times.
+      socket.removeAllListeners();
       socket.disconnect();
       socketSetup.current = false;
       clearTimeout(typingTimerRef.current);
       clearInterval(replayTimerRef.current);
+      // Tear down Yjs
+      if (bindingRef.current) { bindingRef.current.destroy(); bindingRef.current = null; }
+      if (ydocRef.current)    { ydocRef.current.destroy();    ydocRef.current    = null; }
+      // Tear down cursor decorations
       decorationCollections.current.forEach((c) => c.clear());
       decorationCollections.current.clear();
       selectionCollections.current.forEach((c) => c.clear());
@@ -245,16 +254,14 @@ export default function RoomPage() {
       setPasswordRequired(false);
       setPasswordError("");
 
-      // Load the file list for this room (seeds a default file for old rooms automatically)
       const { data: filesData } = await api.get(`/api/v1/rooms/${roomId}/files`);
       setFiles(filesData);
       if (filesData.length > 0) {
         const first = filesData[0];
         setActiveFile(first);
         activeFileIdRef.current = first._id;
-        isRemoteChange.current = true;
-        setCode(first.content);
         setLanguage(first.language);
+        // Content will be set by yjs-sync-response after onMount fires
       }
 
       connectSocket();
@@ -278,51 +285,33 @@ export default function RoomPage() {
 
     socket.on("connect", () => {
       socket.emit("join-room", { roomId, userName: user?.name || "Anonymous" });
-      // On reconnect re-join the specific file so presence + content stay correct
-      if (activeFileIdRef.current) {
-        socket.emit("join-file", { roomId, fileId: activeFileIdRef.current });
+      // Only re-request Yjs state on RECONNECTION — when ydocRef is already
+      // set (editor was mounted before the drop). On initial connect ydocRef
+      // is null; handleEditorMount fires shortly after and requests sync then.
+      if (activeFileIdRef.current && ydocRef.current) {
+        socket.emit("yjs-sync-request", { roomId, fileId: activeFileIdRef.current });
       }
     });
 
     socket.connect();
 
-    // init-code: server sends first file content on join-room (backward compat path)
-    socket.on("init-code", ({ code: initCode }) => {
-      const current = editorRef.current?.getModel()?.getValue();
-      if (current !== initCode) {
-        isRemoteChange.current = true;
-        setCode(initCode);
-      }
+    // ── Yjs sync ──────────────────────────────────────────────────────────
+    // Full Y.Doc state sent in response to yjs-sync-request.
+    // Socket.io delivers binary attachments as ArrayBuffer in the browser;
+    // new Uint8Array() wraps it without copying.
+    socket.on("yjs-sync-response", ({ fileId, state }) => {
+      if (!ydocRef.current || fileId !== activeFileIdRef.current) return;
+      Y.applyUpdate(ydocRef.current, new Uint8Array(state), "socket");
     });
 
-    // init-file: response to join-file — provides fresh content for a specific file
-    socket.on("init-file", ({ fileId, content, language: lang }) => {
-      if (fileId !== activeFileIdRef.current) return; // user switched away before it arrived
-      const current = editorRef.current?.getModel()?.getValue();
-      if (current !== content) {
-        isRemoteChange.current = true;
-        setCode(content);
-      }
-      if (lang) setLanguage(lang);
-      fileCache.current.set(fileId, content);
+    // Incremental update from another client — apply to local Y.Doc
+    socket.on("yjs-update", ({ fileId, update }) => {
+      if (!ydocRef.current || fileId !== activeFileIdRef.current) return;
+      Y.applyUpdate(ydocRef.current, new Uint8Array(update), "socket");
     });
 
-    // code-update: someone else typed; fileId present since Stage 2
-    socket.on("code-update", ({ code: remoteCode, language: lang, fileId }) => {
-      if (fileId && fileId !== activeFileIdRef.current) {
-        // Different file — cache so switching to it is instant
-        fileCache.current.set(fileId, remoteCode);
-        return;
-      }
-      const current = editorRef.current?.getModel()?.getValue();
-      if (current !== remoteCode) {
-        isRemoteChange.current = true;
-        setCode(remoteCode);
-      }
-      if (lang) setLanguage(lang);
-    });
 
-    // language-update: someone changed the language for a file
+    // ── Language ──────────────────────────────────────────────────────────
     socket.on("language-update", ({ language: lang, fileId }) => {
       if (fileId && fileId !== activeFileIdRef.current) {
         setFiles((prev) => prev.map((f) => (f._id === fileId ? { ...f, language: lang } : f)));
@@ -373,13 +362,12 @@ export default function RoomPage() {
       setFiles(remaining);
       if (activeFileIdRef.current === fileId && remaining.length > 0) {
         const fallback = remaining[0];
+        clearAllRemoteCursors();
+        // Update state — the key change on activeFile triggers Editor remount,
+        // which creates a fresh Y.Doc and requests Yjs sync for the fallback file.
         activeFileIdRef.current = fallback._id;
         setActiveFile(fallback);
-        isRemoteChange.current = true;
-        setCode(fileCache.current.get(fallback._id) ?? fallback.content);
         setLanguage(fallback.language);
-        clearAllRemoteCursors();
-        socket.emit("join-file", { roomId, fileId: fallback._id });
       }
     });
 
@@ -403,22 +391,18 @@ export default function RoomPage() {
   function switchFile(file) {
     if (!file || file._id === activeFileIdRef.current) return;
 
-    // Cache current content so switching back is instant
-    if (activeFileIdRef.current) {
-      fileCache.current.set(activeFileIdRef.current, code);
-    }
+    // Destroy current binding + Y.Doc — onMount for the new file will create fresh ones
+    if (bindingRef.current) { bindingRef.current.destroy(); bindingRef.current = null; }
+    if (ydocRef.current)    { ydocRef.current.destroy();    ydocRef.current    = null; }
 
-    // Clear cursors — they belong to the old file
     clearAllRemoteCursors();
 
     activeFileIdRef.current = file._id;
     setActiveFile(file);
-    isRemoteChange.current = true;
-    setCode(fileCache.current.has(file._id) ? fileCache.current.get(file._id) : file.content);
     setLanguage(file.language);
 
-    // Ask server for fresh content and update presence
-    socket.emit("join-file", { roomId, fileId: file._id });
+    // Notify server of presence change (Yjs sync will happen in onMount via key remount)
+    socket.emit("active-file-change", { roomId, fileId: file._id });
   }
 
   async function addFile() {
@@ -475,21 +459,50 @@ export default function RoomPage() {
     }
   }
 
-  // ── Editor callbacks ──────────────────────────────────────────────────────
-
-  function handleCodeChange(value) {
-    if (isRemoteChange.current) {
-      isRemoteChange.current = false;
-      return;
-    }
-    setCode(value);
-    socket.emit("code-change", { roomId, code: value, language, fileId: activeFileIdRef.current });
-  }
+  // ── Editor mount — creates Y.Doc + y-monaco binding for the active file ──
 
   function handleEditorMount(editor) {
     editorRef.current = editor;
-    isRemoteChange.current = false;
 
+    // Tear down any stale binding/ydoc from a previous file
+    if (bindingRef.current) { bindingRef.current.destroy(); bindingRef.current = null; }
+    if (ydocRef.current)    { ydocRef.current.destroy();    ydocRef.current    = null; }
+
+    const model = editor.getModel();
+    if (!model) return;
+
+    // Create a fresh Y.Doc for this file
+    const ydoc  = new Y.Doc();
+    const yText = ydoc.getText("content");
+
+    // Bind Y.Text ↔ Monaco model. The binding drives all content updates;
+    // we no longer set editor content via React state.
+    const binding = new MonacoBinding(yText, model, new Set([editor]));
+
+    ydocRef.current    = ydoc;
+    bindingRef.current = binding;
+
+    // Emit local Yjs updates to the server as raw binary.
+    // Passing the Uint8Array directly lets Socket.io use its binary framing
+    // instead of JSON-encoding each byte as a decimal number (~3× the size).
+    // Origin 'socket' is skipped to avoid re-broadcasting received updates.
+    ydoc.on("update", (update, origin) => {
+      if (origin === "socket") return;
+      socket.emit("yjs-update", {
+        roomId,
+        fileId: activeFileIdRef.current,
+        update,
+      });
+    });
+
+    // Request the full current state for this file from the server.
+    // yjs-sync-response will apply it, populating the editor via the binding.
+    socket.emit("yjs-sync-request", {
+      roomId,
+      fileId: activeFileIdRef.current,
+    });
+
+    // Cursor broadcasting — unchanged from original
     editor.onDidChangeCursorSelection((e) => {
       const now = Date.now();
       if (now - lastCursorEmit.current < 50) return;
@@ -533,7 +546,8 @@ export default function RoomPage() {
   }
 
   function downloadCode() {
-    const blob = new Blob([code], { type: "text/plain" });
+    const content = ydocRef.current?.getText("content").toString() ?? "";
+    const blob = new Blob([content], { type: "text/plain" });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement("a");
     a.href     = url;
@@ -565,6 +579,7 @@ export default function RoomPage() {
   async function runCode() {
     if (runningBy) return;
     const name = user?.name || "Anonymous";
+    const code = ydocRef.current?.getText("content").toString() ?? "";
     setRunningBy(name);
     setRunOutput(null);
     socket.emit("run-start", { roomId, runnerName: name });
@@ -610,8 +625,6 @@ export default function RoomPage() {
   }
 
   // ── Session replay ────────────────────────────────────────────────────────
-  // Replay is per-room: shows the complete editing history across all files.
-  // This is simpler and more useful than per-file replay (no "pick a file" step).
 
   async function openReplay() {
     setReplayLoading(true);
@@ -726,7 +739,6 @@ export default function RoomPage() {
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Language selector — scoped to the active file */}
           <select
             value={language}
             onChange={handleLanguageChange}
@@ -735,7 +747,6 @@ export default function RoomPage() {
             {LANGUAGES.map((l) => <option key={l} value={l}>{l}</option>)}
           </select>
 
-          {/* Theme selector */}
           <select
             value={editorTheme}
             onChange={(e) => setEditorTheme(e.target.value)}
@@ -744,7 +755,6 @@ export default function RoomPage() {
             {THEMES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
           </select>
 
-          {/* Run */}
           <button
             onClick={runCode}
             disabled={!!runningBy}
@@ -753,7 +763,6 @@ export default function RoomPage() {
             {runningBy ? `${runningBy.split(" ")[0]} running...` : "Run"}
           </button>
 
-          {/* Participant avatars */}
           <div className="flex -space-x-1">
             {participants.slice(0, 4).map((p) => (
               <div key={p.socketId} className="relative">
@@ -824,7 +833,6 @@ export default function RoomPage() {
             {files.map((file) => (
               <div key={file._id}>
                 {renaming?.fileId === file._id ? (
-                  /* Inline rename input */
                   <form
                     onSubmit={(e) => { e.preventDefault(); renameFile(file._id, renaming.name); }}
                     className="px-1"
@@ -847,15 +855,11 @@ export default function RoomPage() {
                         : "text-gray-400 hover:bg-gray-800/50 hover:text-gray-200"
                     }`}
                   >
-                    {/* Language badge */}
                     <span className="text-xs font-mono text-gray-600 w-4 flex-shrink-0 leading-none select-none">
                       {FILE_ICONS[file.language] || "??"}
                     </span>
-
-                    {/* File name */}
                     <span className="flex-1 text-xs truncate leading-none">{file.name}</span>
 
-                    {/* Presence dots — others viewing this file */}
                     <div className="flex gap-0.5 flex-shrink-0">
                       {filePresence
                         .filter(
@@ -871,7 +875,6 @@ export default function RoomPage() {
                         ))}
                     </div>
 
-                    {/* Rename / delete — visible on hover */}
                     <div className="hidden group-hover:flex items-center gap-0.5 flex-shrink-0">
                       <button
                         onClick={(e) => {
@@ -898,7 +901,6 @@ export default function RoomPage() {
               </div>
             ))}
 
-            {/* New file inline input */}
             {addingFile && (
               <form onSubmit={(e) => { e.preventDefault(); addFile(); }} className="mt-1 px-1">
                 <input
@@ -957,7 +959,6 @@ export default function RoomPage() {
                 />
               </div>
 
-              {/* Timeline controls */}
               <div className="bg-gray-900 border-t border-gray-800 px-4 pt-3 pb-2 flex-shrink-0">
                 <input
                   type="range"
@@ -1007,14 +1008,15 @@ export default function RoomPage() {
             </>
           ) : (
             <>
-              {/* Live editor */}
+              {/* Live editor — uncontrolled; Yjs drives all content via y-monaco binding.
+                  Key includes activeFile._id so React remounts the editor on file switch,
+                  which triggers handleEditorMount to create a fresh Y.Doc for the new file. */}
               <div className="flex-1 overflow-hidden">
                 <Editor
-                  key="live"
+                  key={activeFile?._id || "live"}
                   height="100%"
                   language={MONACO_LANG[language] || "javascript"}
-                  value={code}
-                  onChange={handleCodeChange}
+                  defaultValue=""
                   onMount={handleEditorMount}
                   theme={editorTheme}
                   options={{
