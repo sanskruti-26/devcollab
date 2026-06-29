@@ -1,4 +1,4 @@
-// pages/RoomPage.jsx — collaborative editor with live cursors, chat, and more
+// pages/RoomPage.jsx — collaborative editor with multi-file support
 import { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import Editor from "@monaco-editor/react";
@@ -16,11 +16,20 @@ const MONACO_LANG = {
   cpp: "cpp",
 };
 
+// Short text badge shown in the file sidebar next to each filename
+const FILE_ICONS = {
+  javascript: "JS",
+  typescript: "TS",
+  python:     "PY",
+  java:       "JV",
+  cpp:        "C+",
+};
+
 const CURSOR_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899", "#ef4444"];
 
 const THEMES = [
-  { value: "vs-dark", label: "Dark" },
-  { value: "vs", label: "Light" },
+  { value: "vs-dark",  label: "Dark" },
+  { value: "vs",       label: "Light" },
   { value: "hc-black", label: "High Contrast" },
 ];
 
@@ -29,7 +38,6 @@ function getCursorColor(socketId) {
   return CURSOR_COLORS[hash % CURSOR_COLORS.length];
 }
 
-// Injects CSS for a user's cursor line highlight and selection highlight
 function injectCursorCSS(socketId, color) {
   if (document.getElementById(`cstyle-${socketId}`)) return;
   const [r, g, b] = [
@@ -51,49 +59,70 @@ export default function RoomPage() {
   const navigate = useNavigate();
   const { user } = useAuth();
 
-  const [room, setRoom] = useState(null);
-  const [code, setCode] = useState("// Loading...");
-  const [language, setLanguage] = useState("javascript");
+  // ── Room & editor core ────────────────────────────────────────────────────
+  const [room, setRoom]             = useState(null);
+  const [code, setCode]             = useState("// Loading...");
+  const [language, setLanguage]     = useState("javascript");
   const [editorTheme, setEditorTheme] = useState("vs-dark");
   const [participants, setParticipants] = useState([]);
-  const [copied, setCopied] = useState(false);
-  const [shareOpen, setShareOpen] = useState(false);
+  const [copied, setCopied]         = useState(false);
+  const [shareOpen, setShareOpen]   = useState(false);
 
-  // Password protection
+  // ── Password protection ───────────────────────────────────────────────────
   const [passwordRequired, setPasswordRequired] = useState(false);
-  const [roomPassword, setRoomPassword] = useState("");
-  const [passwordError, setPasswordError] = useState("");
+  const [roomPassword, setRoomPassword]         = useState("");
+  const [passwordError, setPasswordError]       = useState("");
 
-  // Chat
-  const [chatOpen, setChatOpen] = useState(false);
-  const [messages, setMessages] = useState([]);
-  const [newMessage, setNewMessage] = useState("");
+  // ── Multi-file ────────────────────────────────────────────────────────────
+  const [files, setFiles]               = useState([]);
+  const [activeFile, setActiveFile]     = useState(null);  // full file object
+  const [filePresence, setFilePresence] = useState([]);    // [{socketId,userName,activeFileId}]
+  // Sidebar UI state
+  const [addingFile, setAddingFile]   = useState(false);
+  const [newFileName, setNewFileName] = useState("");
+  const [renaming, setRenaming]       = useState(null);    // {fileId,name} | null
+
+  // ── Chat ──────────────────────────────────────────────────────────────────
+  const [chatOpen, setChatOpen]       = useState(false);
+  const [messages, setMessages]       = useState([]);
+  const [newMessage, setNewMessage]   = useState("");
   const [typingUsers, setTypingUsers] = useState([]);
 
-  // Code execution — shared across all users via socket
-  const [runOutput, setRunOutput] = useState(null);  // { output, by } | null
-  const [runningBy, setRunningBy] = useState(null);  // name of whoever clicked Run
+  // ── Code execution ────────────────────────────────────────────────────────
+  const [runOutput, setRunOutput]   = useState(null);   // {output,by} | null
+  const [runningBy, setRunningBy]   = useState(null);   // name of runner
 
-  // Session replay
-  const [replayMode, setReplayMode] = useState(false);
+  // ── Session replay ────────────────────────────────────────────────────────
+  const [replayMode, setReplayMode]           = useState(false);
   const [replaySnapshots, setReplaySnapshots] = useState([]);
-  const [replayIndex, setReplayIndex] = useState(0);
-  const [replayPlaying, setReplayPlaying] = useState(false);
-  const [replayLoading, setReplayLoading] = useState(false);
+  const [replayIndex, setReplayIndex]         = useState(0);
+  const [replayPlaying, setReplayPlaying]     = useState(false);
+  const [replayLoading, setReplayLoading]     = useState(false);
 
-  // Toasts
+  // ── Toasts ────────────────────────────────────────────────────────────────
   const [toasts, setToasts] = useState([]);
 
-  const isRemoteChange = useRef(false);
-  const editorRef = useRef(null);
-  const chatEndRef = useRef(null);
-  const typingTimerRef = useRef(null);
-  const lastCursorEmit = useRef(0);
-  const socketSetup = useRef(false);               // prevent duplicate event registration
-  const decorationCollections = useRef(new Map()); // socketId -> line highlight collection
-  const selectionCollections = useRef(new Map());  // socketId -> selection highlight collection
-  const cursorWidgets = useRef(new Map());         // socketId -> { widget, domNode }
-  const replayTimerRef = useRef(null);             // setInterval handle for auto-play
+  // ── Refs ──────────────────────────────────────────────────────────────────
+  const isRemoteChange    = useRef(false);
+  const editorRef         = useRef(null);
+  const chatEndRef        = useRef(null);
+  const typingTimerRef    = useRef(null);
+  const lastCursorEmit    = useRef(0);
+  const socketSetup       = useRef(false);
+  const decorationCollections = useRef(new Map());
+  const selectionCollections  = useRef(new Map());
+  const cursorWidgets     = useRef(new Map());
+  const replayTimerRef    = useRef(null);
+
+  // Kept in sync with state so socket event handlers (set up once) never go stale
+  const activeFileIdRef = useRef(null);
+  const filesRef        = useRef([]);
+  // Per-file content cache — enables instant display when switching back to a file
+  const fileCache = useRef(new Map());
+
+  // Keep refs in sync with state
+  useEffect(() => { activeFileIdRef.current = activeFile?._id || null; }, [activeFile]);
+  useEffect(() => { filesRef.current = files; },                        [files]);
 
   useEffect(() => {
     loadRoom();
@@ -118,21 +147,21 @@ export default function RoomPage() {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // ── Toast ─────────────────────────────────────────────────────────────────
+
   function addToast(message) {
     const id = Date.now();
     setToasts((prev) => [...prev, { id, message }]);
     setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 3000);
   }
 
-  // Update or add the floating name label above a remote user's cursor
+  // ── Cursor decorations ────────────────────────────────────────────────────
+
   function updateCursorWidget(socketId, userName, lineNumber) {
     const editor = editorRef.current;
     if (!editor) return;
-
     const color = getCursorColor(socketId);
     const existing = cursorWidgets.current.get(socketId);
-
-    // Remove old widget so we can re-add at the new line
     if (existing) editor.removeContentWidget(existing.widget);
 
     const domNode = document.createElement("div");
@@ -140,14 +169,13 @@ export default function RoomPage() {
     domNode.style.cssText = `background:${color};color:white;font-size:11px;padding:1px 6px;border-radius:3px 3px 3px 0;white-space:nowrap;pointer-events:none;font-family:-apple-system,sans-serif;line-height:16px;`;
 
     const widget = {
-      getId: () => `clabel-${socketId}`,
-      getDomNode: () => domNode,
+      getId:       () => `clabel-${socketId}`,
+      getDomNode:  () => domNode,
       getPosition: () => ({
-        position: { lineNumber, column: 1 },
-        preference: [1], // 1 = ContentWidgetPositionPreference.ABOVE
+        position:   { lineNumber, column: 1 },
+        preference: [1],
       }),
     };
-
     editor.addContentWidget(widget);
     cursorWidgets.current.set(socketId, { widget, domNode });
   }
@@ -155,13 +183,11 @@ export default function RoomPage() {
   function updateRemoteCursor(socketId, userName, position, selection) {
     const editor = editorRef.current;
     if (!editor) return;
-
     const color = getCursorColor(socketId);
     injectCursorCSS(socketId, color);
 
-    // 1. Line highlight decoration
     const lineDecoration = {
-      range: { startLineNumber: position.lineNumber, startColumn: 1, endLineNumber: position.lineNumber, endColumn: 1 },
+      range:   { startLineNumber: position.lineNumber, startColumn: 1, endLineNumber: position.lineNumber, endColumn: 1 },
       options: { isWholeLine: true, className: `rcursor-${socketId}`, overviewRuler: { color } },
     };
     const existingLine = decorationCollections.current.get(socketId);
@@ -171,19 +197,14 @@ export default function RoomPage() {
       decorationCollections.current.set(socketId, editor.createDecorationsCollection([lineDecoration]));
     }
 
-    // 2. Floating name label (content widget)
     updateCursorWidget(socketId, userName, position.lineNumber);
 
-    // 3. Selection highlight (only when text is actually selected)
     const existingSel = selectionCollections.current.get(socketId);
     const hasSelection = selection &&
       (selection.startLineNumber !== selection.endLineNumber || selection.startColumn !== selection.endColumn);
 
     if (hasSelection) {
-      const selDecoration = {
-        range: selection,
-        options: { className: `rselection-${socketId}` },
-      };
+      const selDecoration = { range: selection, options: { className: `rselection-${socketId}` } };
       if (existingSel) {
         existingSel.set([selDecoration]);
       } else {
@@ -205,15 +226,37 @@ export default function RoomPage() {
     document.getElementById(`cstyle-${socketId}`)?.remove();
   }
 
+  function clearAllRemoteCursors() {
+    decorationCollections.current.forEach((c) => c.clear());
+    decorationCollections.current.clear();
+    selectionCollections.current.forEach((c) => c.clear());
+    selectionCollections.current.clear();
+    cursorWidgets.current.forEach(({ widget }) => editorRef.current?.removeContentWidget(widget));
+    cursorWidgets.current.clear();
+  }
+
+  // ── Room + file loading ───────────────────────────────────────────────────
+
   async function loadRoom(password = null) {
     try {
       const params = password ? { password } : {};
-      const { data } = await api.get(`/api/v1/rooms/${roomId}`, { params });
-      setRoom(data);
-      setCode(data.content);
-      setLanguage(data.language);
+      const { data: roomData } = await api.get(`/api/v1/rooms/${roomId}`, { params });
+      setRoom(roomData);
       setPasswordRequired(false);
       setPasswordError("");
+
+      // Load the file list for this room (seeds a default file for old rooms automatically)
+      const { data: filesData } = await api.get(`/api/v1/rooms/${roomId}/files`);
+      setFiles(filesData);
+      if (filesData.length > 0) {
+        const first = filesData[0];
+        setActiveFile(first);
+        activeFileIdRef.current = first._id;
+        isRemoteChange.current = true;
+        setCode(first.content);
+        setLanguage(first.language);
+      }
+
       connectSocket();
     } catch (err) {
       if (err.response?.data?.requiresPassword) {
@@ -227,18 +270,23 @@ export default function RoomPage() {
     }
   }
 
+  // ── Socket setup ──────────────────────────────────────────────────────────
+
   function connectSocket() {
-    if (socketSetup.current) return; // already connected
+    if (socketSetup.current) return;
     socketSetup.current = true;
 
-    // "connect" fires on initial connect AND every reconnect in Socket.io v4
-    // (socket.on("reconnect") is a Manager event and won't fire on the socket instance)
     socket.on("connect", () => {
       socket.emit("join-room", { roomId, userName: user?.name || "Anonymous" });
+      // On reconnect re-join the specific file so presence + content stay correct
+      if (activeFileIdRef.current) {
+        socket.emit("join-file", { roomId, fileId: activeFileIdRef.current });
+      }
     });
 
     socket.connect();
 
+    // init-code: server sends first file content on join-room (backward compat path)
     socket.on("init-code", ({ code: initCode }) => {
       const current = editorRef.current?.getModel()?.getValue();
       if (current !== initCode) {
@@ -247,7 +295,25 @@ export default function RoomPage() {
       }
     });
 
-    socket.on("code-update", ({ code: remoteCode, language: lang }) => {
+    // init-file: response to join-file — provides fresh content for a specific file
+    socket.on("init-file", ({ fileId, content, language: lang }) => {
+      if (fileId !== activeFileIdRef.current) return; // user switched away before it arrived
+      const current = editorRef.current?.getModel()?.getValue();
+      if (current !== content) {
+        isRemoteChange.current = true;
+        setCode(content);
+      }
+      if (lang) setLanguage(lang);
+      fileCache.current.set(fileId, content);
+    });
+
+    // code-update: someone else typed; fileId present since Stage 2
+    socket.on("code-update", ({ code: remoteCode, language: lang, fileId }) => {
+      if (fileId && fileId !== activeFileIdRef.current) {
+        // Different file — cache so switching to it is instant
+        fileCache.current.set(fileId, remoteCode);
+        return;
+      }
       const current = editorRef.current?.getModel()?.getValue();
       if (current !== remoteCode) {
         isRemoteChange.current = true;
@@ -256,7 +322,15 @@ export default function RoomPage() {
       if (lang) setLanguage(lang);
     });
 
-    socket.on("language-update", ({ language: lang }) => setLanguage(lang));
+    // language-update: someone changed the language for a file
+    socket.on("language-update", ({ language: lang, fileId }) => {
+      if (fileId && fileId !== activeFileIdRef.current) {
+        setFiles((prev) => prev.map((f) => (f._id === fileId ? { ...f, language: lang } : f)));
+        return;
+      }
+      setLanguage(lang);
+    });
+
     socket.on("participants-update", (list) => setParticipants(list));
 
     socket.on("user-joined", ({ userName }) => addToast(`${userName} joined`));
@@ -266,30 +340,142 @@ export default function RoomPage() {
       setTypingUsers((prev) => prev.filter((u) => u !== userName));
     });
 
-    socket.on("cursor-update", ({ socketId, userName, position, selection }) => {
+    // cursor-update: only render cursors for users on the same file
+    socket.on("cursor-update", ({ socketId, userName, position, selection, fileId }) => {
+      if (fileId && fileId !== activeFileIdRef.current) {
+        clearRemoteCursor(socketId);
+        return;
+      }
       updateRemoteCursor(socketId, userName, position, selection);
     });
 
-    // Shared code execution events
-    socket.on("run-start", ({ runnerName }) => {
-      setRunningBy(runnerName);
-      setRunOutput(null);
-    });
-    socket.on("run-result", ({ output, runnerName }) => {
-      setRunningBy(null);
-      setRunOutput({ output, by: runnerName });
+    // ── File presence ─────────────────────────────────────────────────────
+    socket.on("file-presence-update", (presence) => setFilePresence(presence));
+
+    // ── File CRUD broadcasts from other users ─────────────────────────────
+    socket.on("file-created", ({ file }) => {
+      setFiles((prev) => [...prev, file]);
+      addToast(`New file: ${file.name}`);
     });
 
+    socket.on("file-renamed", ({ fileId, name, language: lang }) => {
+      setFiles((prev) =>
+        prev.map((f) => (f._id === fileId ? { ...f, name, language: lang } : f))
+      );
+      if (activeFileIdRef.current === fileId) {
+        setActiveFile((prev) => (prev ? { ...prev, name, language: lang } : prev));
+        setLanguage(lang);
+      }
+    });
+
+    socket.on("file-deleted", ({ fileId }) => {
+      const remaining = filesRef.current.filter((f) => f._id !== fileId);
+      setFiles(remaining);
+      if (activeFileIdRef.current === fileId && remaining.length > 0) {
+        const fallback = remaining[0];
+        activeFileIdRef.current = fallback._id;
+        setActiveFile(fallback);
+        isRemoteChange.current = true;
+        setCode(fileCache.current.get(fallback._id) ?? fallback.content);
+        setLanguage(fallback.language);
+        clearAllRemoteCursors();
+        socket.emit("join-file", { roomId, fileId: fallback._id });
+      }
+    });
+
+    // ── Execution ─────────────────────────────────────────────────────────
+    socket.on("run-start",  ({ runnerName }) => { setRunningBy(runnerName); setRunOutput(null); });
+    socket.on("run-result", ({ output, runnerName }) => { setRunningBy(null); setRunOutput({ output, by: runnerName }); });
+
+    // ── Chat ──────────────────────────────────────────────────────────────
     socket.on("message-history", (msgs) => setMessages(msgs));
-    socket.on("new-message", (msg) => setMessages((prev) => [...prev, msg]));
-
-    socket.on("user-typing", ({ userName }) => {
-      setTypingUsers((prev) => (prev.includes(userName) ? prev : [...prev, userName]));
-    });
-    socket.on("user-stopped-typing", ({ userName }) => {
-      setTypingUsers((prev) => prev.filter((u) => u !== userName));
-    });
+    socket.on("new-message",     (msg)  => setMessages((prev) => [...prev, msg]));
+    socket.on("user-typing",         ({ userName }) =>
+      setTypingUsers((prev) => (prev.includes(userName) ? prev : [...prev, userName]))
+    );
+    socket.on("user-stopped-typing", ({ userName }) =>
+      setTypingUsers((prev) => prev.filter((u) => u !== userName))
+    );
   }
+
+  // ── File operations ───────────────────────────────────────────────────────
+
+  function switchFile(file) {
+    if (!file || file._id === activeFileIdRef.current) return;
+
+    // Cache current content so switching back is instant
+    if (activeFileIdRef.current) {
+      fileCache.current.set(activeFileIdRef.current, code);
+    }
+
+    // Clear cursors — they belong to the old file
+    clearAllRemoteCursors();
+
+    activeFileIdRef.current = file._id;
+    setActiveFile(file);
+    isRemoteChange.current = true;
+    setCode(fileCache.current.has(file._id) ? fileCache.current.get(file._id) : file.content);
+    setLanguage(file.language);
+
+    // Ask server for fresh content and update presence
+    socket.emit("join-file", { roomId, fileId: file._id });
+  }
+
+  async function addFile() {
+    const name = newFileName.trim();
+    if (!name) return;
+    try {
+      const { data: file } = await api.post(`/api/v1/rooms/${roomId}/files`, { name });
+      setFiles((prev) => [...prev, file]);
+      setNewFileName("");
+      setAddingFile(false);
+      socket.emit("announce-file-created", { roomId, file });
+      switchFile(file);
+    } catch (err) {
+      if (err.response?.status === 409) addToast("A file with that name already exists");
+      else addToast("Could not create file");
+    }
+  }
+
+  async function renameFile(fileId, newName) {
+    const name = newName.trim();
+    if (!name) { setRenaming(null); return; }
+    try {
+      const { data: updated } = await api.patch(`/api/v1/rooms/${roomId}/files/${fileId}`, { name });
+      setFiles((prev) =>
+        prev.map((f) => (f._id === fileId ? { ...f, name: updated.name, language: updated.language } : f))
+      );
+      if (activeFileIdRef.current === fileId) {
+        setActiveFile((prev) => (prev ? { ...prev, name: updated.name, language: updated.language } : prev));
+        setLanguage(updated.language);
+      }
+      setRenaming(null);
+      socket.emit("announce-file-renamed", {
+        roomId, fileId, name: updated.name, language: updated.language,
+      });
+    } catch (err) {
+      if (err.response?.status === 409) addToast("A file with that name already exists");
+      else addToast("Could not rename file");
+      setRenaming(null);
+    }
+  }
+
+  async function deleteFile(file) {
+    if (filesRef.current.length <= 1) { addToast("Cannot delete the last file"); return; }
+    try {
+      await api.delete(`/api/v1/rooms/${roomId}/files/${file._id}`);
+      const remaining = filesRef.current.filter((f) => f._id !== file._id);
+      setFiles(remaining);
+      socket.emit("announce-file-deleted", { roomId, fileId: file._id });
+      if (activeFileIdRef.current === file._id && remaining.length > 0) {
+        switchFile(remaining[0]);
+      }
+    } catch (err) {
+      addToast("Could not delete file");
+    }
+  }
+
+  // ── Editor callbacks ──────────────────────────────────────────────────────
 
   function handleCodeChange(value) {
     if (isRemoteChange.current) {
@@ -297,14 +483,13 @@ export default function RoomPage() {
       return;
     }
     setCode(value);
-    socket.emit("code-change", { roomId, code: value, language });
+    socket.emit("code-change", { roomId, code: value, language, fileId: activeFileIdRef.current });
   }
 
   function handleEditorMount(editor) {
     editorRef.current = editor;
     isRemoteChange.current = false;
 
-    // Track cursor AND selection changes, throttled to 20/s
     editor.onDidChangeCursorSelection((e) => {
       const now = Date.now();
       if (now - lastCursorEmit.current < 50) return;
@@ -317,11 +502,12 @@ export default function RoomPage() {
 
       socket.emit("cursor-move", {
         roomId,
-        position: { lineNumber: sel.positionLineNumber, column: sel.positionColumn },
+        position:  { lineNumber: sel.positionLineNumber, column: sel.positionColumn },
         selection: hasSelection
           ? { startLineNumber: sel.startLineNumber, startColumn: sel.startColumn,
               endLineNumber: sel.endLineNumber, endColumn: sel.endColumn }
           : null,
+        fileId: activeFileIdRef.current,
       });
     });
   }
@@ -329,8 +515,16 @@ export default function RoomPage() {
   function handleLanguageChange(e) {
     const lang = e.target.value;
     setLanguage(lang);
-    socket.emit("language-change", { roomId, language: lang });
+    if (activeFile) {
+      setActiveFile((prev) => (prev ? { ...prev, language: lang } : prev));
+      setFiles((prev) =>
+        prev.map((f) => (f._id === activeFile._id ? { ...f, language: lang } : f))
+      );
+    }
+    socket.emit("language-change", { roomId, language: lang, fileId: activeFileIdRef.current });
   }
+
+  // ── Utilities ─────────────────────────────────────────────────────────────
 
   function copyShareLink() {
     navigator.clipboard.writeText(window.location.href);
@@ -339,15 +533,16 @@ export default function RoomPage() {
   }
 
   function downloadCode() {
-    const extensions = { javascript: "js", typescript: "ts", python: "py", java: "java", cpp: "cpp" };
     const blob = new Blob([code], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `code.${extensions[language] || "txt"}`;
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href     = url;
+    a.download = activeFile?.name || "code.txt";
     a.click();
     URL.revokeObjectURL(url);
   }
+
+  // ── Chat ──────────────────────────────────────────────────────────────────
 
   function handleMessageChange(e) {
     setNewMessage(e.target.value);
@@ -365,16 +560,15 @@ export default function RoomPage() {
     setNewMessage("");
   }
 
-  async function runCode() {
-    if (runningBy) return; // block if someone is already running
-    const name = user?.name || "Anonymous";
+  // ── Code execution ────────────────────────────────────────────────────────
 
-    // Show "running" immediately on the runner's tab; broadcast to others via socket
+  async function runCode() {
+    if (runningBy) return;
+    const name = user?.name || "Anonymous";
     setRunningBy(name);
     setRunOutput(null);
     socket.emit("run-start", { roomId, runnerName: name });
 
-    // Calls the execute API and returns the output string
     async function attempt() {
       const { data } = await api.post("/api/v1/rooms/execute", { code, language });
       return data.output || "(no output)";
@@ -385,29 +579,22 @@ export default function RoomPage() {
       try {
         output = await attempt();
       } catch (firstErr) {
-        // 503 with JUDGE0_KEY message = config error, no point retrying
-        const is503NoKey = firstErr.response?.status === 503 &&
+        const is503NoKey =
+          firstErr.response?.status === 503 &&
           firstErr.response?.data?.error?.includes("JUDGE0_KEY");
-        const isRetryable = !is503NoKey &&
-          (!firstErr.response || firstErr.response.status >= 500);
-
+        const isRetryable = !is503NoKey && (!firstErr.response || firstErr.response.status >= 500);
         if (!isRetryable) throw firstErr;
-
-        // Likely Render cold start — show hint as a subtitle under "running..."
-        // then retry once after 3 s (by then Render should be awake)
         setRunOutput({ output: "Server is waking up — retrying in 3 seconds...", by: name });
         await new Promise((r) => setTimeout(r, 3000));
         setRunOutput(null);
-        output = await attempt(); // throws if retry also fails → caught below
+        output = await attempt();
       }
-
       setRunningBy(null);
       setRunOutput({ output, by: name });
       socket.emit("run-result", { roomId, output, runnerName: name });
     } catch (err) {
-      const status = err.response?.status;
+      const status    = err.response?.status;
       const serverMsg = err.response?.data?.error || "";
-
       let output;
       if (status === 503 && serverMsg.includes("JUDGE0_KEY")) {
         output = "Code execution not configured — add JUDGE0_KEY to backend/.env";
@@ -416,32 +603,26 @@ export default function RoomPage() {
       } else {
         output = serverMsg || err.message || "Execution failed";
       }
-
       setRunningBy(null);
       setRunOutput({ output, by: name });
       socket.emit("run-result", { roomId, output, runnerName: name });
     }
   }
 
-  // ── Session replay ─────────────────────────────────────────────────────────
+  // ── Session replay ────────────────────────────────────────────────────────
+  // Replay is per-room: shows the complete editing history across all files.
+  // This is simpler and more useful than per-file replay (no "pick a file" step).
 
   async function openReplay() {
     setReplayLoading(true);
-    console.log(`[Replay] fetching room=${roomId}`);
     try {
       const { data } = await api.get(`/api/v1/rooms/${roomId}/replay`);
-      console.log(`[Replay] loaded ${data.length} snapshots`);
-      if (!data.length) {
-        addToast("No replay data yet — edit some code first");
-        return;
-      }
+      if (!data.length) { addToast("No replay data yet — edit some code first"); return; }
       setReplaySnapshots(data);
       setReplayIndex(0);
       setReplayMode(true);
     } catch (err) {
       const status = err.response?.status;
-      const msg = err.response?.data?.error || err.message;
-      console.error(`[Replay] failed — status=${status} msg=${msg}`);
       addToast(status === 403 ? "Access denied for replay" : `Could not load replay (${status ?? "network error"})`);
     } finally {
       setReplayLoading(false);
@@ -474,7 +655,7 @@ export default function RoomPage() {
     }, 750);
   }
 
-  // ── Password modal (full-screen block until correct password entered) ──────
+  // ── Password gate ─────────────────────────────────────────────────────────
   if (passwordRequired) {
     return (
       <div className="min-h-screen bg-gray-950 flex items-center justify-center">
@@ -505,21 +686,24 @@ export default function RoomPage() {
             onClick={() => navigate("/dashboard")}
             className="mt-3 w-full text-gray-500 hover:text-gray-300 text-sm transition"
           >
-            ← Back to dashboard
+            Back to dashboard
           </button>
         </div>
       </div>
     );
   }
 
-  // ── Main editor UI ──────────────────────────────────────────────────────────
+  // ── Main UI ───────────────────────────────────────────────────────────────
   return (
     <div className="h-screen flex flex-col bg-gray-950">
 
       {/* Toast notifications */}
       <div className="fixed top-4 right-4 z-50 flex flex-col gap-2 pointer-events-none">
         {toasts.map((t) => (
-          <div key={t.id} className="bg-gray-800 border border-gray-700 text-white text-sm px-4 py-2.5 rounded-lg shadow-xl">
+          <div
+            key={t.id}
+            className="bg-gray-800 border border-gray-700 text-white text-sm px-4 py-2.5 rounded-lg shadow-xl"
+          >
             {t.message}
           </div>
         ))}
@@ -528,16 +712,21 @@ export default function RoomPage() {
       {/* Top bar */}
       <div className="bg-gray-900 border-b border-gray-800 px-4 py-2 flex items-center justify-between flex-shrink-0">
         <div className="flex items-center gap-3">
-          <button onClick={() => navigate("/dashboard")} className="text-gray-400 hover:text-white text-sm transition">
-            ← Back
+          <button
+            onClick={() => navigate("/dashboard")}
+            className="text-gray-400 hover:text-white text-sm transition"
+          >
+            Back
           </button>
           <span className="text-white font-semibold">{room?.name || "Loading..."}</span>
           {room?.hasPassword && <span title="Password protected" className="text-gray-500 text-xs">🔒</span>}
-          <span className="text-gray-500 text-xs font-mono bg-gray-800 px-2 py-0.5 rounded">#{roomId}</span>
+          <span className="text-gray-500 text-xs font-mono bg-gray-800 px-2 py-0.5 rounded">
+            #{roomId}
+          </span>
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Language selector */}
+          {/* Language selector — scoped to the active file */}
           <select
             value={language}
             onChange={handleLanguageChange}
@@ -555,16 +744,16 @@ export default function RoomPage() {
             {THEMES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
           </select>
 
-          {/* Run — disabled while anyone in the room is running */}
+          {/* Run */}
           <button
             onClick={runCode}
             disabled={!!runningBy}
             className="bg-green-600 hover:bg-green-500 disabled:bg-green-900 disabled:text-green-700 text-white px-3 py-1 rounded-lg text-sm font-medium transition"
           >
-            {runningBy ? `${runningBy.split(" ")[0]} running...` : "▶ Run"}
+            {runningBy ? `${runningBy.split(" ")[0]} running...` : "Run"}
           </button>
 
-          {/* Participant avatars with online dot */}
+          {/* Participant avatars */}
           <div className="flex -space-x-1">
             {participants.slice(0, 4).map((p) => (
               <div key={p.socketId} className="relative">
@@ -580,33 +769,37 @@ export default function RoomPage() {
             ))}
           </div>
 
-          {/* Download */}
-          <button onClick={downloadCode} className="bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-3 py-1 rounded-lg text-sm transition">
-            ⬇ Download
+          <button
+            onClick={downloadCode}
+            className="bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-3 py-1 rounded-lg text-sm transition"
+          >
+            Download
           </button>
 
-          {/* Share */}
-          <button onClick={() => setShareOpen(true)} className="bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-3 py-1 rounded-lg text-sm transition">
+          <button
+            onClick={() => setShareOpen(true)}
+            className="bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-3 py-1 rounded-lg text-sm transition"
+          >
             Share
           </button>
 
-          {/* Replay */}
           {!replayMode && (
             <button
               onClick={openReplay}
               disabled={replayLoading}
               className="bg-purple-700 hover:bg-purple-600 disabled:opacity-50 text-white px-3 py-1 rounded-lg text-sm font-medium transition"
             >
-              {replayLoading ? "Loading..." : "⏪ Replay"}
+              {replayLoading ? "Loading..." : "Replay"}
             </button>
           )}
 
-          {/* Chat toggle */}
           <button
             onClick={() => setChatOpen((v) => !v)}
-            className={`px-3 py-1 rounded-lg text-sm transition ${chatOpen ? "bg-blue-600 text-white" : "bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white"}`}
+            className={`px-3 py-1 rounded-lg text-sm transition ${
+              chatOpen ? "bg-blue-600 text-white" : "bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white"
+            }`}
           >
-            💬
+            Chat
           </button>
         </div>
       </div>
@@ -614,18 +807,129 @@ export default function RoomPage() {
       {/* Main content */}
       <div className="flex-1 flex overflow-hidden">
 
-        {/* Editor + output  OR  Replay panel */}
+        {/* ── File sidebar ─────────────────────────────────────────────── */}
+        <div className="w-44 bg-gray-900 border-r border-gray-800 flex flex-col flex-shrink-0">
+          <div className="px-3 py-2 border-b border-gray-800 flex items-center justify-between">
+            <span className="text-gray-500 text-xs font-semibold uppercase tracking-wider">Files</span>
+            <button
+              onClick={() => { setAddingFile(true); setNewFileName(""); }}
+              title="New file"
+              className="text-gray-500 hover:text-white transition text-lg leading-none w-5 h-5 flex items-center justify-center"
+            >
+              +
+            </button>
+          </div>
+
+          <div className="flex-1 overflow-y-auto py-1">
+            {files.map((file) => (
+              <div key={file._id}>
+                {renaming?.fileId === file._id ? (
+                  /* Inline rename input */
+                  <form
+                    onSubmit={(e) => { e.preventDefault(); renameFile(file._id, renaming.name); }}
+                    className="px-1"
+                  >
+                    <input
+                      autoFocus
+                      value={renaming.name}
+                      onChange={(e) => setRenaming({ ...renaming, name: e.target.value })}
+                      onBlur={() => renameFile(file._id, renaming.name)}
+                      onKeyDown={(e) => e.key === "Escape" && setRenaming(null)}
+                      className="w-full bg-gray-800 border border-blue-500 text-white text-xs px-2 py-1 outline-none rounded"
+                    />
+                  </form>
+                ) : (
+                  <div
+                    onClick={() => switchFile(file)}
+                    className={`group px-2 py-1.5 cursor-pointer flex items-center gap-1.5 ${
+                      file._id === activeFile?._id
+                        ? "bg-gray-800 text-white"
+                        : "text-gray-400 hover:bg-gray-800/50 hover:text-gray-200"
+                    }`}
+                  >
+                    {/* Language badge */}
+                    <span className="text-xs font-mono text-gray-600 w-4 flex-shrink-0 leading-none select-none">
+                      {FILE_ICONS[file.language] || "??"}
+                    </span>
+
+                    {/* File name */}
+                    <span className="flex-1 text-xs truncate leading-none">{file.name}</span>
+
+                    {/* Presence dots — others viewing this file */}
+                    <div className="flex gap-0.5 flex-shrink-0">
+                      {filePresence
+                        .filter(
+                          (p) => p.activeFileId === file._id && p.socketId !== socket.id
+                        )
+                        .map((p) => (
+                          <div
+                            key={p.socketId}
+                            title={p.userName}
+                            style={{ backgroundColor: getCursorColor(p.socketId) }}
+                            className="w-1.5 h-1.5 rounded-full"
+                          />
+                        ))}
+                    </div>
+
+                    {/* Rename / delete — visible on hover */}
+                    <div className="hidden group-hover:flex items-center gap-0.5 flex-shrink-0">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setRenaming({ fileId: file._id, name: file.name });
+                        }}
+                        title="Rename"
+                        className="text-gray-500 hover:text-gray-200 text-xs px-0.5 leading-none"
+                      >
+                        ✎
+                      </button>
+                      {files.length > 1 && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); deleteFile(file); }}
+                          title="Delete"
+                          className="text-gray-500 hover:text-red-400 text-xs px-0.5 leading-none"
+                        >
+                          ✕
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+
+            {/* New file inline input */}
+            {addingFile && (
+              <form onSubmit={(e) => { e.preventDefault(); addFile(); }} className="mt-1 px-1">
+                <input
+                  autoFocus
+                  value={newFileName}
+                  onChange={(e) => setNewFileName(e.target.value)}
+                  onBlur={() => { if (!newFileName.trim()) setAddingFile(false); }}
+                  onKeyDown={(e) => e.key === "Escape" && setAddingFile(false)}
+                  placeholder="filename.js"
+                  className="w-full bg-gray-800 border border-blue-500 text-white text-xs px-2 py-1.5 outline-none rounded placeholder-gray-600"
+                />
+              </form>
+            )}
+          </div>
+        </div>
+
+        {/* ── Editor + output  OR  Replay panel ──────────────────────── */}
         <div className="flex-1 flex flex-col overflow-hidden">
           {replayMode ? (
-            /* ── Replay panel ─────────────────────────────────────────── */
             <>
               {/* Replay header */}
               <div className="bg-gray-900 border-b border-gray-800 px-4 py-2 flex items-center justify-between flex-shrink-0">
                 <div className="flex items-center gap-3">
-                  <span className="text-purple-400 text-sm font-semibold">⏪ Replay</span>
-                  <span className="text-white text-sm">{replaySnapshots[replayIndex]?.userName}</span>
+                  <span className="text-purple-400 text-sm font-semibold">Replay</span>
+                  <span className="text-white text-sm">
+                    {replaySnapshots[replayIndex]?.userName}
+                  </span>
                   <span className="text-gray-500 text-xs">
-                    {new Date(replaySnapshots[replayIndex]?.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                    {new Date(replaySnapshots[replayIndex]?.createdAt).toLocaleTimeString([], {
+                      hour: "2-digit", minute: "2-digit", second: "2-digit",
+                    })}
                   </span>
                   <span className="text-gray-600 text-xs font-mono">
                     {replayIndex + 1} / {replaySnapshots.length}
@@ -635,11 +939,10 @@ export default function RoomPage() {
                   onClick={closeReplay}
                   className="bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-3 py-1 rounded-lg text-sm transition"
                 >
-                  ✕ Exit Replay
+                  Exit Replay
                 </button>
               </div>
 
-              {/* Read-only editor showing the snapshot at current index */}
               <div className="flex-1 overflow-hidden">
                 <Editor
                   key="replay"
@@ -647,7 +950,10 @@ export default function RoomPage() {
                   language={MONACO_LANG[language] || "javascript"}
                   value={replaySnapshots[replayIndex]?.content || ""}
                   theme={editorTheme}
-                  options={{ fontSize: 14, minimap: { enabled: false }, readOnly: true, scrollBeyondLastLine: false, wordWrap: "on", tabSize: 2 }}
+                  options={{
+                    fontSize: 14, minimap: { enabled: false }, readOnly: true,
+                    scrollBeyondLastLine: false, wordWrap: "on", tabSize: 2,
+                  }}
                 />
               </div>
 
@@ -667,38 +973,41 @@ export default function RoomPage() {
                 />
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    {/* Jump to start */}
                     <button
                       onClick={() => { clearInterval(replayTimerRef.current); setReplayPlaying(false); setReplayIndex(0); }}
                       className="bg-gray-800 hover:bg-gray-700 text-gray-300 px-2 py-1 rounded text-sm transition"
-                      title="Jump to start"
-                    >⏮</button>
-
-                    {/* Play / Pause */}
+                    >
+                      |&lt;
+                    </button>
                     <button
                       onClick={() => togglePlay(replaySnapshots)}
                       className="bg-purple-600 hover:bg-purple-500 text-white px-4 py-1 rounded-lg text-sm font-medium transition"
                     >
-                      {replayPlaying ? "⏸ Pause" : "▶ Play"}
+                      {replayPlaying ? "Pause" : "Play"}
                     </button>
-
-                    {/* Jump to end */}
                     <button
-                      onClick={() => { clearInterval(replayTimerRef.current); setReplayPlaying(false); setReplayIndex(replaySnapshots.length - 1); }}
+                      onClick={() => {
+                        clearInterval(replayTimerRef.current);
+                        setReplayPlaying(false);
+                        setReplayIndex(replaySnapshots.length - 1);
+                      }}
                       className="bg-gray-800 hover:bg-gray-700 text-gray-300 px-2 py-1 rounded text-sm transition"
-                      title="Jump to end"
-                    >⏭</button>
+                    >
+                      &gt;|
+                    </button>
                   </div>
                   <span className="text-gray-600 text-xs">
-                    {new Date(replaySnapshots[0]?.createdAt).toLocaleDateString([], { month: "short", day: "numeric" })}
+                    {new Date(replaySnapshots[0]?.createdAt).toLocaleDateString([], {
+                      month: "short", day: "numeric",
+                    })}
                     {" · "}{replaySnapshots.length} snapshots
                   </span>
                 </div>
               </div>
             </>
           ) : (
-            /* ── Live editor ───────────────────────────────────────────── */
             <>
+              {/* Live editor */}
               <div className="flex-1 overflow-hidden">
                 <Editor
                   key="live"
@@ -708,15 +1017,21 @@ export default function RoomPage() {
                   onChange={handleCodeChange}
                   onMount={handleEditorMount}
                   theme={editorTheme}
-                  options={{ fontSize: 14, minimap: { enabled: false }, scrollBeyondLastLine: false, wordWrap: "on", tabSize: 2 }}
+                  options={{
+                    fontSize: 14, minimap: { enabled: false },
+                    scrollBeyondLastLine: false, wordWrap: "on", tabSize: 2,
+                  }}
                 />
               </div>
 
+              {/* Output panel */}
               {(runOutput !== null || runningBy !== null) && (
                 <div className="h-40 border-t border-gray-800 bg-gray-950 flex flex-col flex-shrink-0">
                   <div className="flex items-center justify-between px-4 py-1.5 border-b border-gray-800">
                     <div className="flex items-center gap-2">
-                      <span className="text-gray-400 text-xs font-mono font-semibold tracking-widest">OUTPUT</span>
+                      <span className="text-gray-400 text-xs font-mono font-semibold tracking-widest">
+                        OUTPUT
+                      </span>
                       {runOutput?.by && (
                         <span className="text-gray-400 text-xs">· ran by {runOutput.by}</span>
                       )}
@@ -725,7 +1040,7 @@ export default function RoomPage() {
                       onClick={() => { setRunOutput(null); setRunningBy(null); }}
                       className="text-gray-600 hover:text-gray-300 text-xs transition"
                     >
-                      ✕ close
+                      close
                     </button>
                   </div>
                   <div className="flex-1 overflow-y-auto px-4 py-2">
@@ -739,7 +1054,9 @@ export default function RoomPage() {
                         )}
                       </div>
                     ) : (
-                      <pre className="text-green-400 text-sm font-mono whitespace-pre-wrap">{runOutput?.output}</pre>
+                      <pre className="text-green-400 text-sm font-mono whitespace-pre-wrap">
+                        {runOutput?.output}
+                      </pre>
                     )}
                   </div>
                 </div>
@@ -748,21 +1065,30 @@ export default function RoomPage() {
           )}
         </div>
 
-        {/* Chat panel */}
+        {/* ── Chat panel ──────────────────────────────────────────────── */}
         {chatOpen && (
           <div className="w-72 border-l border-gray-800 flex flex-col bg-gray-900 flex-shrink-0">
             <div className="px-4 py-2.5 border-b border-gray-800 flex items-center justify-between">
               <span className="text-white text-sm font-semibold">Chat</span>
-              <button onClick={() => setChatOpen(false)} className="text-gray-500 hover:text-gray-300 text-xs transition">✕</button>
+              <button
+                onClick={() => setChatOpen(false)}
+                className="text-gray-500 hover:text-gray-300 text-xs transition"
+              >
+                close
+              </button>
             </div>
             <div className="flex-1 overflow-y-auto p-3 space-y-3">
-              {messages.length === 0 && <p className="text-gray-600 text-xs text-center mt-4">No messages yet</p>}
+              {messages.length === 0 && (
+                <p className="text-gray-600 text-xs text-center mt-4">No messages yet</p>
+              )}
               {messages.map((msg) => (
                 <div key={msg._id}>
                   <div className="flex items-baseline gap-1.5">
                     <span className="text-blue-400 text-xs font-semibold">{msg.userName}</span>
                     <span className="text-gray-600 text-xs">
-                      {new Date(msg.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                      {new Date(msg.createdAt).toLocaleTimeString([], {
+                        hour: "2-digit", minute: "2-digit",
+                      })}
                     </span>
                   </div>
                   <p className="text-gray-200 text-sm mt-0.5 break-words">{msg.text}</p>
@@ -785,7 +1111,11 @@ export default function RoomPage() {
                   placeholder="Send a message..."
                   className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
                 />
-                <button type="submit" disabled={!newMessage.trim()} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white px-3 py-1.5 rounded-lg text-sm transition">
+                <button
+                  type="submit"
+                  disabled={!newMessage.trim()}
+                  className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white px-3 py-1.5 rounded-lg text-sm transition"
+                >
                   Send
                 </button>
               </div>
@@ -797,15 +1127,24 @@ export default function RoomPage() {
       {/* Status bar */}
       <div className="bg-gray-900 border-t border-gray-800 px-4 py-1 flex items-center justify-between text-xs text-gray-500 flex-shrink-0">
         <span>{participants.length} user{participants.length !== 1 ? "s" : ""} online</span>
+        <span>{activeFile?.name || ""}</span>
         <span>Auto-saves every 5 seconds</span>
       </div>
 
       {/* Share modal */}
       {shareOpen && (
-        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center" onClick={() => setShareOpen(false)}>
-          <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-96 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div
+          className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center"
+          onClick={() => setShareOpen(false)}
+        >
+          <div
+            className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-96 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
             <h3 className="text-white font-semibold mb-1">Invite collaborators</h3>
-            <p className="text-gray-400 text-sm mb-4">Share this link — anyone with it can join the room</p>
+            <p className="text-gray-400 text-sm mb-4">
+              Share this link — anyone with it can join the room
+            </p>
             <div className="flex gap-2">
               <input
                 readOnly
@@ -813,11 +1152,17 @@ export default function RoomPage() {
                 onFocus={(e) => e.target.select()}
                 className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none"
               />
-              <button onClick={copyShareLink} className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition">
-                {copied ? "✓" : "Copy"}
+              <button
+                onClick={copyShareLink}
+                className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition"
+              >
+                {copied ? "Copied" : "Copy"}
               </button>
             </div>
-            <button onClick={() => setShareOpen(false)} className="mt-4 w-full text-gray-500 hover:text-gray-300 text-sm transition">
+            <button
+              onClick={() => setShareOpen(false)}
+              className="mt-4 w-full text-gray-500 hover:text-gray-300 text-sm transition"
+            >
               Close
             </button>
           </div>

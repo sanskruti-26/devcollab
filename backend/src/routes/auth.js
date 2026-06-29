@@ -1,9 +1,27 @@
 // routes/auth.js — /api/v1/auth/register and /api/v1/auth/login
-const router = require("express").Router();
-const jwt = require("jsonwebtoken");
-const User = require("../models/User");
+const router    = require("express").Router();
+const jwt       = require("jsonwebtoken");
+const rateLimit = require("express-rate-limit");
+const User      = require("../models/User");
 
-// Helper: sign a JWT for a user
+// 10 login attempts per 15 minutes per IP
+const loginLimiter = rateLimit({
+  windowMs:      15 * 60 * 1000,
+  max:           10,
+  standardHeaders: true,
+  legacyHeaders:  false,
+  message: { error: "Too many login attempts — please try again in 15 minutes" },
+});
+
+// 5 registrations per hour per IP
+const registerLimiter = rateLimit({
+  windowMs:      60 * 60 * 1000,
+  max:           5,
+  standardHeaders: true,
+  legacyHeaders:  false,
+  message: { error: "Too many accounts created from this IP — please try again later" },
+});
+
 function signToken(user) {
   return jwt.sign(
     { id: user._id, name: user.name, email: user.email },
@@ -13,7 +31,7 @@ function signToken(user) {
 }
 
 // POST /api/v1/auth/register
-router.post("/register", async (req, res) => {
+router.post("/register", registerLimiter, async (req, res) => {
   try {
     const { name, email, password } = req.body;
     if (!name || !email || !password)
@@ -32,7 +50,7 @@ router.post("/register", async (req, res) => {
 });
 
 // POST /api/v1/auth/login
-router.post("/login", async (req, res) => {
+router.post("/login", loginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password)

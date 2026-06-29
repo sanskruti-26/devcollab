@@ -7,10 +7,22 @@ const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
 const mongoose = require("mongoose");
+const rateLimit = require("express-rate-limit");
 
 const authRoutes = require("./routes/auth");
 const roomRoutes = require("./routes/rooms");
 const { setupSocketHandlers } = require("./services/roomService");
+
+// General API: 200 requests per minute per IP — generous for real-time collab
+// but blocks bots hammering the rooms/files/execute endpoints.
+// Auth-route limiters (login/register) live in routes/auth.js, applied inline.
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests — please slow down" },
+});
 
 const app = express();
 const server = http.createServer(app);
@@ -26,13 +38,19 @@ const io = new Server(server, {
   },
 });
 
+// Trust the first proxy hop so req.ip contains the real client IP behind Render's
+// load balancer. Without this, express-rate-limit v8 detects X-Forwarded-For and
+// bypasses rate limiting entirely to avoid incorrectly blocking all users who
+// share the proxy's IP address.
+app.set("trust proxy", 1);
+
 // Middleware
 app.use(cors({ origin: CLIENT_URL }));
 app.use(express.json());
 
-// Routes
-app.use("/api/v1/auth", authRoutes);
-app.use("/api/v1/rooms", roomRoutes);
+// Routes (auth limiters are applied inline inside routes/auth.js)
+app.use("/api/v1/auth",  authRoutes);
+app.use("/api/v1/rooms", apiLimiter, roomRoutes);
 
 // Health check
 app.get("/health", (req, res) => res.json({ status: "ok" }));
