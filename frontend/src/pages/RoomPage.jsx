@@ -40,6 +40,24 @@ function getCursorColor(socketId) {
   return CURSOR_COLORS[hash % CURSOR_COLORS.length];
 }
 
+// Browser-safe Uint8Array -> base64 (no Buffer). Used only to encode a freshly
+// created Yjs relative position for transport — resolution happens server-side.
+function uint8ToBase64(bytes) {
+  let binary = "";
+  bytes.forEach((b) => { binary += String.fromCharCode(b); });
+  return btoa(binary);
+}
+
+// 0-based character index of the start of `lineNumber` (1-based) within `text`.
+function lineNumberToIndex(text, lineNumber) {
+  let line = 1, i = 0;
+  while (line < lineNumber && i < text.length) {
+    if (text[i] === "\n") line++;
+    i++;
+  }
+  return i;
+}
+
 function injectCursorCSS(socketId, color) {
   if (document.getElementById(`cstyle-${socketId}`)) return;
   const [r, g, b] = [
@@ -109,6 +127,18 @@ export default function RoomPage() {
   // ── Toasts ────────────────────────────────────────────────────────────────
   const [toasts, setToasts] = useState([]);
 
+  // ── Inline comments ───────────────────────────────────────────────────────
+  // Anchored to lineNumber only — heavy edits above a commented line will
+  // drift the comment from the code it was meant for. Known tradeoff, not
+  // fixed here (would need Yjs relative-position tracking).
+  const [comments, setComments]             = useState([]);
+  const [commentsOpen, setCommentsOpen]     = useState(false);
+  const [composerLine, setComposerLine]     = useState(null);
+  const [composerText, setComposerText]     = useState("");
+  const [activeLine, setActiveLine]         = useState(null);
+  const [replyDrafts, setReplyDrafts]       = useState({});
+  const [toggledThreads, setToggledThreads] = useState(new Set());
+
   // ── Refs ──────────────────────────────────────────────────────────────────
   const editorRef         = useRef(null);
   const chatEndRef        = useRef(null);
@@ -120,6 +150,9 @@ export default function RoomPage() {
   const selectionCollections  = useRef(new Map());
   const cursorWidgets     = useRef(new Map());
   const replayTimerRef    = useRef(null);
+  const commentsRef           = useRef([]);
+  const commentDecorationsRef = useRef(null);
+  const monacoRef             = useRef(null);
 
   // Yjs: one Y.Doc + MonacoBinding per active file. Destroyed + recreated on file switch.
   const ydocRef    = useRef(null);
@@ -131,6 +164,7 @@ export default function RoomPage() {
 
   useEffect(() => { activeFileIdRef.current = activeFile?._id || null; }, [activeFile]);
   useEffect(() => { filesRef.current = files; },                        [files]);
+  useEffect(() => { commentsRef.current = comments; },                  [comments]);
 
   useEffect(() => {
     loadRoom();
@@ -157,6 +191,8 @@ export default function RoomPage() {
         editorRef.current?.removeContentWidget(widget);
       });
       cursorWidgets.current.clear();
+      commentDecorationsRef.current?.clear();
+      commentDecorationsRef.current = null;
     };
   }, [roomId]);
 
@@ -167,6 +203,34 @@ export default function RoomPage() {
   useEffect(() => {
     aiEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [aiMessages, aiLoading]);
+
+  // Inject glyph-margin CSS once — mirrors injectCursorCSS's one-time-style pattern
+  useEffect(() => {
+    if (document.getElementById("comment-glyph-style")) return;
+    const el = document.createElement("style");
+    el.id = "comment-glyph-style";
+    el.textContent = `
+      .comment-glyph::before { content: "💬"; font-size: 12px; cursor: pointer; }
+      .comment-glyph-resolved::before { opacity: 0.35; }
+    `;
+    document.head.appendChild(el);
+  }, []);
+
+  // Reload comments whenever the active file changes
+  useEffect(() => {
+    if (!activeFile?._id) return;
+    setComments([]);
+    setComposerLine(null);
+    setComposerText("");
+    setActiveLine(null);
+    loadComments(activeFile._id);
+  }, [activeFile?._id]);
+
+  // Recompute gutter glyphs whenever the comment list changes (see redrawCommentDecorations
+  // below for why this also has to re-run on every keystroke, not just here).
+  useEffect(() => {
+    redrawCommentDecorations();
+  }, [comments]);
 
   // ── Toast ─────────────────────────────────────────────────────────────────
 
@@ -396,6 +460,22 @@ export default function RoomPage() {
     socket.on("user-stopped-typing", ({ userName }) =>
       setTypingUsers((prev) => prev.filter((u) => u !== userName))
     );
+
+    // ── Inline comments ──────────────────────────────────────────────────
+    socket.on("comment-created", (comment) => {
+      if (comment.fileId !== activeFileIdRef.current) return;
+      setComments((prev) => (prev.some((c) => c._id === comment._id) ? prev : [...prev, comment]));
+    });
+    socket.on("comment-resolved", ({ commentId, resolved }) => {
+      setComments((prev) => prev.map((c) => (c._id === commentId ? { ...c, resolved } : c)));
+    });
+    socket.on("comment-relocated", ({ commentId, lineNumber }) => {
+      setComments((prev) => prev.map((c) => (c._id === commentId ? { ...c, lineNumber } : c)));
+    });
+    socket.on("comment-deleted", ({ fileId, commentIds }) => {
+      if (fileId !== activeFileIdRef.current) return;
+      setComments((prev) => prev.filter((c) => !commentIds.includes(c._id)));
+    });
   }
 
   // ── File operations ───────────────────────────────────────────────────────
@@ -474,8 +554,10 @@ export default function RoomPage() {
 
   // ── Editor mount — creates Y.Doc + y-monaco binding for the active file ──
 
-  function handleEditorMount(editor) {
+  function handleEditorMount(editor, monaco) {
     editorRef.current = editor;
+    monacoRef.current = monaco;
+    commentDecorationsRef.current = null; // fresh editor instance — old collection no longer applies
 
     // Tear down any stale binding/ydoc from a previous file
     if (bindingRef.current) { bindingRef.current.destroy(); bindingRef.current = null; }
@@ -538,6 +620,18 @@ export default function RoomPage() {
         fileId: activeFileIdRef.current,
       });
     });
+
+    // Gutter click — opens a line's thread, or starts a new one if the line is empty
+    editor.onMouseDown((e) => {
+      if (e.target.type !== monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN) return;
+      const lineNumber = e.target.position?.lineNumber;
+      if (lineNumber) openCommentsForLine(lineNumber);
+    });
+
+    // Re-pin comment glyphs to their canonical lines on every edit — see
+    // redrawCommentDecorations for why this can't just rely on the comments-state effect.
+    editor.onDidChangeModelContent(() => redrawCommentDecorations());
+    redrawCommentDecorations(); // initial paint for this fresh editor instance
   }
 
   function handleLanguageChange(e) {
@@ -569,6 +663,133 @@ export default function RoomPage() {
     a.download = activeFile?.name || "code.txt";
     a.click();
     URL.revokeObjectURL(url);
+  }
+
+  // ── Inline comments ───────────────────────────────────────────────────────
+
+  async function loadComments(fileId) {
+    try {
+      const { data } = await api.get(`/api/v1/rooms/${roomId}/files/${fileId}/comments`);
+      setComments(data);
+    } catch (err) {
+      console.error("Could not load comments:", err.message);
+    }
+  }
+
+  // Unresolved threads are expanded by default, resolved ones collapsed —
+  // toggledThreads flips a single thread away from that default.
+  function isThreadExpanded(comment) {
+    const flipped = toggledThreads.has(comment._id);
+    const defaultOpen = !comment.resolved;
+    return flipped ? !defaultOpen : defaultOpen;
+  }
+
+  function toggleThread(id) {
+    setToggledThreads((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }
+
+  // Rebuilds the gutter glyph decorations from the canonical comments state.
+  // Must run on every document edit, not just when `comments` changes — Monaco
+  // decorations are sticky by default and silently drift/duplicate as the user
+  // types (most visibly: a zero-width point range can split across both sides
+  // of a newline insertion), which made pressing Enter look like it spawned new
+  // empty comment indicators. Forcing a full redraw on every keystroke keeps the
+  // rendered glyphs pinned exactly to the stored lineNumber, every time.
+  function redrawCommentDecorations() {
+    const editor = editorRef.current;
+    if (!editor) return;
+
+    const lineState = new Map();
+    commentsRef.current.filter((c) => !c.parentId).forEach((c) => {
+      if (!c.resolved) lineState.set(c.lineNumber, "active");
+      else if (!lineState.has(c.lineNumber)) lineState.set(c.lineNumber, "resolved");
+    });
+
+    const decorations = [...lineState.entries()].map(([lineNumber, state]) => ({
+      range: { startLineNumber: lineNumber, startColumn: 1, endLineNumber: lineNumber, endColumn: 1 },
+      options: {
+        isWholeLine: true, // a gutter marker belongs to the whole line, not a column point
+        glyphMarginClassName: state === "active" ? "comment-glyph" : "comment-glyph comment-glyph-resolved",
+        glyphMarginHoverMessage: { value: "Click to view comments" },
+        stickiness: monacoRef.current?.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+      },
+    }));
+
+    if (commentDecorationsRef.current) commentDecorationsRef.current.set(decorations);
+    else commentDecorationsRef.current = editor.createDecorationsCollection(decorations);
+  }
+
+  // Gutter click: opens the existing thread(s) on that line, or starts a new one
+  function openCommentsForLine(lineNumber) {
+    setCommentsOpen(true);
+    setActiveLine(lineNumber);
+    const lineThreads = commentsRef.current.filter((c) => !c.parentId && c.lineNumber === lineNumber);
+    if (lineThreads.length === 0) {
+      setComposerLine(lineNumber);
+    } else {
+      setComposerLine(null);
+      lineThreads.forEach((c) => { if (!isThreadExpanded(c)) toggleThread(c._id); });
+    }
+  }
+
+  // These don't touch local state directly — the server broadcasts
+  // comment-created/resolved/deleted back to everyone, including the sender,
+  // so the socket handlers below are the single source of truth (same pattern as chat).
+  async function submitNewComment(lineNumber, text) {
+    if (!text.trim() || !activeFileIdRef.current) return;
+    try {
+      // Anchor to the live Y.Doc so the comment can follow edits (and get cleaned
+      // up if its line is deleted) — see roomService.js's reconcileComments.
+      let relativePos = null;
+      const ydoc = ydocRef.current;
+      if (ydoc) {
+        const yText = ydoc.getText("content");
+        const index = lineNumberToIndex(yText.toString(), lineNumber);
+        const relPos = Y.createRelativePositionFromTypeIndex(yText, index);
+        relativePos = uint8ToBase64(Y.encodeRelativePosition(relPos));
+      }
+      await api.post(`/api/v1/rooms/${roomId}/files/${activeFileIdRef.current}/comments`, {
+        lineNumber, text: text.trim(), relativePos,
+      });
+      setComposerLine(null);
+      setComposerText("");
+    } catch (err) {
+      addToast(err.response?.data?.error || "Could not add comment");
+    }
+  }
+
+  async function submitReply(parentId, text) {
+    if (!text.trim() || !activeFileIdRef.current) return;
+    try {
+      await api.post(`/api/v1/rooms/${roomId}/files/${activeFileIdRef.current}/comments`, {
+        text: text.trim(), parentId,
+      });
+      setReplyDrafts((prev) => ({ ...prev, [parentId]: "" }));
+    } catch (err) {
+      addToast(err.response?.data?.error || "Could not reply");
+    }
+  }
+
+  async function toggleResolve(comment) {
+    try {
+      await api.patch(`/api/v1/rooms/${roomId}/comments/${comment._id}/resolve`, {
+        resolved: !comment.resolved,
+      });
+    } catch (err) {
+      addToast("Could not update thread");
+    }
+  }
+
+  async function deleteComment(comment) {
+    try {
+      await api.delete(`/api/v1/rooms/${roomId}/comments/${comment._id}`);
+    } catch (err) {
+      addToast(err.response?.data?.error || "Could not delete comment");
+    }
   }
 
   // ── Chat ──────────────────────────────────────────────────────────────────
@@ -872,6 +1093,20 @@ export default function RoomPage() {
           </button>
 
           <button
+            onClick={() => setCommentsOpen((v) => !v)}
+            className={`px-3 py-1 rounded-lg text-sm transition ${
+              commentsOpen ? "bg-blue-600 text-white" : "bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white"
+            }`}
+          >
+            Comments
+            {comments.filter((c) => !c.parentId && !c.resolved).length > 0 && (
+              <span className="ml-1.5 text-[10px] bg-red-500 text-white rounded-full px-1.5 py-0.5">
+                {comments.filter((c) => !c.parentId && !c.resolved).length}
+              </span>
+            )}
+          </button>
+
+          <button
             onClick={() => setChatOpen((v) => !v)}
             className={`px-3 py-1 rounded-lg text-sm transition ${
               chatOpen ? "bg-blue-600 text-white" : "bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white"
@@ -1089,7 +1324,7 @@ export default function RoomPage() {
                   onMount={handleEditorMount}
                   theme={editorTheme}
                   options={{
-                    fontSize: 14, minimap: { enabled: false },
+                    fontSize: 14, minimap: { enabled: false }, glyphMargin: true,
                     scrollBeyondLastLine: false, wordWrap: "on", tabSize: 2,
                   }}
                 />
@@ -1292,6 +1527,152 @@ export default function RoomPage() {
                 </button>
               </div>
             </form>
+          </div>
+        )}
+
+        {/* ── Comments panel ──────────────────────────────────────────── */}
+        {commentsOpen && (
+          <div className="w-80 border-l border-gray-800 flex flex-col bg-gray-900 flex-shrink-0">
+            <div className="px-4 py-2.5 border-b border-gray-800 flex items-center justify-between">
+              <span className="text-white text-sm font-semibold">Comments</span>
+              <button
+                onClick={() => setCommentsOpen(false)}
+                className="text-gray-500 hover:text-gray-300 text-xs transition"
+              >
+                close
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-3 space-y-3">
+              {composerLine !== null && (
+                <div className="bg-gray-800/60 border border-blue-500/40 rounded-lg p-2.5">
+                  <p className="text-gray-400 text-xs mb-1.5">New comment · line {composerLine}</p>
+                  <textarea
+                    autoFocus
+                    value={composerText}
+                    onChange={(e) => setComposerText(e.target.value)}
+                    rows={2}
+                    placeholder="Leave a comment..."
+                    className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 resize-none"
+                  />
+                  <div className="flex justify-end gap-2 mt-1.5">
+                    <button
+                      onClick={() => { setComposerLine(null); setComposerText(""); }}
+                      className="text-gray-500 hover:text-gray-300 text-xs transition"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={() => submitNewComment(composerLine, composerText)}
+                      disabled={!composerText.trim()}
+                      className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white px-2.5 py-1 rounded text-xs font-medium transition"
+                    >
+                      Comment
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {comments.filter((c) => !c.parentId).length === 0 && composerLine === null && (
+                <p className="text-gray-600 text-xs text-center mt-4">
+                  No comments yet — click the gutter next to a line to start a thread
+                </p>
+              )}
+
+              {comments
+                .filter((c) => !c.parentId)
+                .sort((a, b) => a.lineNumber - b.lineNumber)
+                .map((c) => {
+                  const expanded = isThreadExpanded(c);
+                  const replies = comments.filter((r) => r.parentId === c._id);
+                  const canDelete = c.userId === user?.id || room?.owner === user?.id;
+                  return (
+                    <div
+                      key={c._id}
+                      className={`rounded-lg border p-2.5 ${
+                        activeLine === c.lineNumber ? "border-blue-500/60 bg-gray-800/60" : "border-gray-800 bg-gray-800/30"
+                      } ${c.resolved ? "opacity-60" : ""}`}
+                    >
+                      <div
+                        className="flex items-center justify-between cursor-pointer"
+                        onClick={() => toggleThread(c._id)}
+                      >
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span
+                            className="w-4 h-4 rounded-full flex-shrink-0 flex items-center justify-center text-[9px] font-bold text-white"
+                            style={{ backgroundColor: c.userColor }}
+                          >
+                            {c.userName[0]?.toUpperCase()}
+                          </span>
+                          <span className="text-xs font-semibold truncate" style={{ color: c.userColor }}>
+                            {c.userName}
+                          </span>
+                          <span className="text-gray-600 text-[11px] flex-shrink-0">line {c.lineNumber}</span>
+                        </div>
+                        <div className="flex items-center gap-1.5 flex-shrink-0">
+                          {c.resolved && <span className="text-green-500 text-[10px] font-semibold">RESOLVED</span>}
+                          <span className="text-gray-600 text-xs">{expanded ? "−" : "+"}</span>
+                        </div>
+                      </div>
+
+                      {expanded && (
+                        <>
+                          <p className="text-gray-200 text-sm mt-1.5 break-words">{c.text}</p>
+
+                          {replies.length > 0 && (
+                            <div className="mt-2 ml-2 pl-2 border-l border-gray-700 space-y-2">
+                              {replies.map((r) => (
+                                <div key={r._id}>
+                                  <span className="text-xs font-semibold" style={{ color: r.userColor }}>
+                                    {r.userName}
+                                  </span>
+                                  <p className="text-gray-300 text-xs mt-0.5 break-words">{r.text}</p>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+
+                          <div className="flex items-center gap-2 mt-2">
+                            <input
+                              value={replyDrafts[c._id] || ""}
+                              onChange={(e) => setReplyDrafts((prev) => ({ ...prev, [c._id]: e.target.value }))}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") { e.preventDefault(); submitReply(c._id, replyDrafts[c._id] || ""); }
+                              }}
+                              placeholder="Reply..."
+                              className="flex-1 bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                            />
+                            <button
+                              onClick={() => submitReply(c._id, replyDrafts[c._id] || "")}
+                              disabled={!(replyDrafts[c._id] || "").trim()}
+                              className="text-blue-400 hover:text-blue-300 disabled:opacity-30 text-xs font-medium transition"
+                            >
+                              Reply
+                            </button>
+                          </div>
+
+                          <div className="flex items-center justify-end gap-3 mt-2 pt-2 border-t border-gray-800">
+                            <button
+                              onClick={() => toggleResolve(c)}
+                              className="text-gray-400 hover:text-white text-[11px] transition"
+                            >
+                              {c.resolved ? "Unresolve" : "Resolve"}
+                            </button>
+                            {canDelete && (
+                              <button
+                                onClick={() => deleteComment(c)}
+                                className="text-gray-500 hover:text-red-400 text-[11px] transition"
+                              >
+                                Delete
+                              </button>
+                            )}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  );
+                })}
+            </div>
           </div>
         )}
       </div>
