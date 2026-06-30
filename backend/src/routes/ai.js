@@ -1,14 +1,17 @@
 // routes/ai.js — AI pair programmer endpoint (Google Gemini)
 // POST /api/v1/ai/ask — sends file content + question to Gemini, returns the answer
 const router = require("express").Router();
-const rateLimit = require("express-rate-limit");
+const { rateLimit, ipKeyGenerator } = require("express-rate-limit");
 const auth = require("../middleware/auth");
 
-// 20 AI requests per minute per user (auth runs first so req.user is set)
+// 20 AI requests per minute per user (auth runs first so req.user is set).
+// Falls back to IP only if somehow unauthenticated; ipKeyGenerator normalizes
+// IPv6 addresses (e.g. by /64 prefix) as express-rate-limit v8 requires —
+// using req.ip directly here throws ERR_ERL_KEY_GEN_IPV6 at startup.
 const aiLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 20,
-  keyGenerator: (req) => req.user?.id || req.ip,
+  keyGenerator: (req) => req.user?.id || ipKeyGenerator(req.ip),
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many AI requests — please slow down" },
