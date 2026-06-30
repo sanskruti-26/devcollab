@@ -88,6 +88,12 @@ export default function RoomPage() {
   const [newMessage, setNewMessage]   = useState("");
   const [typingUsers, setTypingUsers] = useState([]);
 
+  // ── AI pair programmer ────────────────────────────────────────────────────
+  const [aiOpen, setAiOpen]         = useState(false);
+  const [aiMessages, setAiMessages] = useState([]);
+  const [aiLoading, setAiLoading]   = useState(false);
+  const [aiInput, setAiInput]       = useState("");
+
   // ── Code execution ────────────────────────────────────────────────────────
   const [runOutput, setRunOutput]   = useState(null);
   const [runningBy, setRunningBy]   = useState(null);
@@ -105,6 +111,7 @@ export default function RoomPage() {
   // ── Refs ──────────────────────────────────────────────────────────────────
   const editorRef         = useRef(null);
   const chatEndRef        = useRef(null);
+  const aiEndRef          = useRef(null);
   const typingTimerRef    = useRef(null);
   const lastCursorEmit    = useRef(0);
   const socketSetup       = useRef(false);
@@ -155,6 +162,10 @@ export default function RoomPage() {
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  useEffect(() => {
+    aiEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [aiMessages, aiLoading]);
 
   // ── Toast ─────────────────────────────────────────────────────────────────
 
@@ -574,6 +585,36 @@ export default function RoomPage() {
     setNewMessage("");
   }
 
+  // ── AI pair programmer ────────────────────────────────────────────────────
+
+  async function askAI(question) {
+    const q = (question || aiInput).trim();
+    if (!q || aiLoading) return;
+    setAiInput("");
+
+    const fileContent = ydocRef.current?.getText("content").toString() ?? "";
+    const msgId = Date.now();
+
+    setAiMessages((prev) => [...prev, { id: msgId, role: "user", content: q }]);
+    setAiLoading(true);
+
+    try {
+      const { data } = await api.post("/api/v1/ai/ask", { fileContent, language, question: q });
+      setAiMessages((prev) => [...prev, { id: msgId + 1, role: "assistant", content: data.answer }]);
+    } catch (err) {
+      const serverMsg = err.response?.data?.error || "";
+      if (serverMsg.includes("not configured")) {
+        addToast("AI not configured — add ANTHROPIC_API_KEY to backend/.env");
+      } else if (err.response?.status === 429) {
+        addToast("Too many AI requests — please slow down");
+      } else {
+        addToast(serverMsg || "AI request failed");
+      }
+    } finally {
+      setAiLoading(false);
+    }
+  }
+
   // ── Code execution ────────────────────────────────────────────────────────
 
   async function runCode() {
@@ -801,6 +842,15 @@ export default function RoomPage() {
               {replayLoading ? "Loading..." : "Replay"}
             </button>
           )}
+
+          <button
+            onClick={() => setAiOpen((v) => !v)}
+            className={`px-3 py-1 rounded-lg text-sm transition ${
+              aiOpen ? "bg-yellow-600 text-white" : "bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white"
+            }`}
+          >
+            Ask AI
+          </button>
 
           <button
             onClick={() => setChatOpen((v) => !v)}
@@ -1066,6 +1116,106 @@ export default function RoomPage() {
             </>
           )}
         </div>
+
+        {/* ── AI pair programmer panel ────────────────────────────────── */}
+        {aiOpen && (
+          <div className="w-80 border-l border-gray-800 flex flex-col bg-gray-900 flex-shrink-0">
+            {/* Header */}
+            <div className="px-4 py-2.5 border-b border-gray-800 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="text-white text-sm font-semibold">Ask AI</span>
+                <span className="text-yellow-400 text-xs">✦</span>
+              </div>
+              <button
+                onClick={() => setAiOpen(false)}
+                className="text-gray-500 hover:text-gray-300 text-xs transition"
+              >
+                close
+              </button>
+            </div>
+
+            {/* Context note */}
+            <div className="px-3 py-1.5 bg-gray-800/40 border-b border-gray-800/60">
+              <p className="text-gray-500 text-xs">
+                AI can see your current file
+                {activeFile?.name ? ` · ${activeFile.name}` : ""}
+              </p>
+            </div>
+
+            {/* Quick-action preset buttons */}
+            <div className="px-3 py-2 border-b border-gray-800/60 flex gap-1.5 flex-wrap">
+              {[
+                { label: "Explain",   prompt: "Explain what this code does, step by step." },
+                { label: "Find bugs", prompt: "Review this code for bugs, edge cases, or potential issues." },
+                { label: "Improve",   prompt: "Suggest concrete improvements to this code." },
+              ].map(({ label, prompt }) => (
+                <button
+                  key={label}
+                  onClick={() => askAI(prompt)}
+                  disabled={aiLoading}
+                  className="text-xs px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white border border-gray-700 transition disabled:opacity-40"
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {/* Conversation */}
+            <div className="flex-1 overflow-y-auto p-3 space-y-3">
+              {aiMessages.length === 0 && !aiLoading && (
+                <p className="text-gray-600 text-xs text-center mt-4">
+                  Ask anything about your code
+                </p>
+              )}
+              {aiMessages.map((msg) => (
+                <div key={msg.id}>
+                  {msg.role === "user" ? (
+                    <div className="flex justify-end">
+                      <div className="inline-block bg-blue-600/30 border border-blue-500/30 rounded-lg px-3 py-2 text-sm text-gray-200 max-w-[90%]">
+                        {msg.content}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="text-gray-200 text-sm leading-relaxed whitespace-pre-wrap break-words">
+                      {msg.content}
+                    </div>
+                  )}
+                </div>
+              ))}
+              {aiLoading && (
+                <div className="flex items-center gap-1.5">
+                  <div className="w-1.5 h-1.5 bg-yellow-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
+                  <div className="w-1.5 h-1.5 bg-yellow-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
+                  <div className="w-1.5 h-1.5 bg-yellow-400 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+                </div>
+              )}
+              <div ref={aiEndRef} />
+            </div>
+
+            {/* Input */}
+            <form
+              onSubmit={(e) => { e.preventDefault(); askAI(aiInput); }}
+              className="p-3 border-t border-gray-800"
+            >
+              <div className="flex gap-2">
+                <input
+                  value={aiInput}
+                  onChange={(e) => setAiInput(e.target.value)}
+                  placeholder="Ask about this code..."
+                  disabled={aiLoading}
+                  className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-yellow-500 disabled:opacity-50"
+                />
+                <button
+                  type="submit"
+                  disabled={!aiInput.trim() || aiLoading}
+                  className="bg-yellow-600 hover:bg-yellow-500 disabled:opacity-40 text-white px-3 py-1.5 rounded-lg text-sm font-medium transition"
+                >
+                  Ask
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
 
         {/* ── Chat panel ──────────────────────────────────────────────── */}
         {chatOpen && (
