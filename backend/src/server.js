@@ -11,6 +11,7 @@ const rateLimit = require("express-rate-limit");
 
 const authRoutes = require("./routes/auth");
 const roomRoutes = require("./routes/rooms");
+const aiRoutes   = require("./routes/ai");
 const { setupSocketHandlers } = require("./services/roomService");
 
 // General API: 200 requests per minute per IP — generous for real-time collab
@@ -51,6 +52,7 @@ app.use(express.json());
 // Routes (auth limiters are applied inline inside routes/auth.js)
 app.use("/api/v1/auth",  authRoutes);
 app.use("/api/v1/rooms", apiLimiter, roomRoutes);
+app.use("/api/v1/ai",    aiRoutes);   // AI limiter is applied per-route inside routes/ai.js
 
 // Health check
 app.get("/health", (req, res) => res.json({ status: "ok" }));
