@@ -89,10 +89,11 @@ export default function RoomPage() {
   const [typingUsers, setTypingUsers] = useState([]);
 
   // ── AI pair programmer ────────────────────────────────────────────────────
-  const [aiOpen, setAiOpen]         = useState(false);
-  const [aiMessages, setAiMessages] = useState([]);
-  const [aiLoading, setAiLoading]   = useState(false);
-  const [aiInput, setAiInput]       = useState("");
+  const [aiOpen, setAiOpen]               = useState(false);
+  const [aiMessages, setAiMessages]       = useState([]);
+  const [aiLoading, setAiLoading]         = useState(false);
+  const [aiInput, setAiInput]             = useState("");
+  const [aiHasSelection, setAiHasSelection] = useState(false);
 
   // ── Code execution ────────────────────────────────────────────────────────
   const [runOutput, setRunOutput]   = useState(null);
@@ -407,6 +408,7 @@ export default function RoomPage() {
     if (ydocRef.current)    { ydocRef.current.destroy();    ydocRef.current    = null; }
 
     clearAllRemoteCursors();
+    setAiHasSelection(false);
 
     activeFileIdRef.current = file._id;
     setActiveFile(file);
@@ -513,16 +515,18 @@ export default function RoomPage() {
       fileId: activeFileIdRef.current,
     });
 
-    // Cursor broadcasting — unchanged from original
+    // Cursor broadcasting — unchanged from original, plus a local flag the AI
+    // panel reads to know whether to use the selection or the whole file as context.
     editor.onDidChangeCursorSelection((e) => {
-      const now = Date.now();
-      if (now - lastCursorEmit.current < 50) return;
-      lastCursorEmit.current = now;
-
       const sel = e.selection;
       const hasSelection = !(
         sel.startLineNumber === sel.endLineNumber && sel.startColumn === sel.endColumn
       );
+      setAiHasSelection(hasSelection);
+
+      const now = Date.now();
+      if (now - lastCursorEmit.current < 50) return;
+      lastCursorEmit.current = now;
 
       socket.emit("cursor-move", {
         roomId,
@@ -593,18 +597,33 @@ export default function RoomPage() {
     setAiInput("");
 
     const fileContent = ydocRef.current?.getText("content").toString() ?? "";
-    const msgId = Date.now();
 
+    // Prefer the editor selection as a focused context when the user has one active
+    let selection = "";
+    const editor = editorRef.current;
+    if (editor) {
+      const sel = editor.getSelection();
+      if (sel && !sel.isEmpty()) {
+        selection = editor.getModel()?.getValueInRange(sel) ?? "";
+      }
+    }
+
+    // Send recent conversation turns so the AI can follow up ("now refactor that")
+    const history = aiMessages.slice(-10).map((m) => ({ role: m.role, content: m.content }));
+
+    const msgId = Date.now();
     setAiMessages((prev) => [...prev, { id: msgId, role: "user", content: q }]);
     setAiLoading(true);
 
     try {
-      const { data } = await api.post("/api/v1/ai/ask", { fileContent, language, question: q });
+      const { data } = await api.post("/api/v1/ai/ask", {
+        fileContent, selection, language, question: q, history,
+      });
       setAiMessages((prev) => [...prev, { id: msgId + 1, role: "assistant", content: data.answer }]);
     } catch (err) {
       const serverMsg = err.response?.data?.error || "";
       if (serverMsg.includes("not configured")) {
-        addToast("AI not configured — add ANTHROPIC_API_KEY to backend/.env");
+        addToast("AI not configured — add GEMINI_API_KEY to backend/.env");
       } else if (err.response?.status === 429) {
         addToast("Too many AI requests — please slow down");
       } else {
@@ -1137,8 +1156,9 @@ export default function RoomPage() {
             {/* Context note */}
             <div className="px-3 py-1.5 bg-gray-800/40 border-b border-gray-800/60">
               <p className="text-gray-500 text-xs">
-                AI can see your current file
-                {activeFile?.name ? ` · ${activeFile.name}` : ""}
+                {aiHasSelection
+                  ? "AI can see your selected code"
+                  : <>AI can see your current file{activeFile?.name ? ` · ${activeFile.name}` : ""}</>}
               </p>
             </div>
 

@@ -15,12 +15,13 @@ const aiLimiter = rateLimit({
 });
 
 // Truncate file content so we don't blow up the context window / token budget
-const MAX_FILE_CHARS = 8000;
-const GEMINI_MODEL   = "gemini-2.5-flash";
+const MAX_FILE_CHARS    = 8000;
+const MAX_HISTORY_TURNS = 10; // last 10 messages (~5 exchanges) of prior conversation
+const GEMINI_MODEL      = "gemini-2.5-flash";
 
 // POST /api/v1/ai/ask
 router.post("/ask", auth, aiLimiter, async (req, res) => {
-  const { fileContent, language, question } = req.body;
+  const { fileContent, selection, language, question, history } = req.body;
 
   if (!question?.trim()) {
     return res.status(400).json({ error: "Question is required" });
@@ -33,21 +34,37 @@ router.post("/ask", auth, aiLimiter, async (req, res) => {
     });
   }
 
-  // Trim the file content so a huge file doesn't eat the whole context window
-  const content = (fileContent || "").slice(0, MAX_FILE_CHARS);
-  const wasTruncated = (fileContent || "").length > MAX_FILE_CHARS;
+  // A selected snippet is smaller and more focused than the whole file — prefer it when present
+  const hasSelection = !!selection?.trim();
+  const rawContext   = hasSelection ? selection : (fileContent || "");
+  const content      = rawContext.slice(0, MAX_FILE_CHARS);
+  const wasTruncated = rawContext.length > MAX_FILE_CHARS;
+  const contextLabel = hasSelection ? "selected code snippet" : "current file";
 
   const systemInstruction = `You are an expert pair programmer helping a developer edit ${language || "code"} in a collaborative editor.
 Be concise and practical. When showing code, use markdown fenced code blocks with the correct language tag.
 Focus on the specific code shared — avoid generic advice when you can be concrete.`;
 
-  const userMessage = `Here is the current file (${language || "unknown"})${wasTruncated ? " [truncated to first 8000 chars]" : ""}:
+  const userMessage = `Here is the ${contextLabel} (${language || "unknown"})${wasTruncated ? " [truncated to first 8000 chars]" : ""}:
 
 \`\`\`${language || ""}
 ${content}
 \`\`\`
 
 My question: ${question.trim()}`;
+
+  // Prior turns let the AI follow up ("now refactor that") instead of answering cold each time.
+  // Capped to the last MAX_HISTORY_TURNS messages to bound token usage.
+  const priorTurns = Array.isArray(history) ? history.slice(-MAX_HISTORY_TURNS) : [];
+  const contents = [
+    ...priorTurns
+      .filter((m) => m?.role && m?.content)
+      .map((m) => ({
+        role: m.role === "assistant" ? "model" : "user",
+        parts: [{ text: String(m.content).slice(0, MAX_FILE_CHARS) }],
+      })),
+    { role: "user", parts: [{ text: userMessage }] },
+  ];
 
   try {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
@@ -59,12 +76,7 @@ My question: ${question.trim()}`;
         systemInstruction: {
           parts: [{ text: systemInstruction }],
         },
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: userMessage }],
-          },
-        ],
+        contents,
         generationConfig: {
           maxOutputTokens: 1024,
         },
