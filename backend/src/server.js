@@ -39,6 +39,11 @@ const io = new Server(server, {
   },
 });
 
+// Exposed so REST routes (e.g. comments in routes/rooms.js) can broadcast
+// over the room's socket channel after a DB write, without importing socket.io
+// logic into the routes themselves.
+app.set("io", io);
+
 // Trust the first proxy hop so req.ip contains the real client IP behind Render's
 // load balancer. Without this, express-rate-limit v8 detects X-Forwarded-For and
 // bypasses rate limiting entirely to avoid incorrectly blocking all users who

@@ -17,6 +17,7 @@ const Room   = require("../models/Room");
 const File   = require("../models/File");
 const Message  = require("../models/Message");
 const Snapshot = require("../models/Snapshot");
+const Comment  = require("../models/Comment");
 
 // ── In-memory caches ──────────────────────────────────────────────────────────
 
@@ -38,6 +39,18 @@ const fileSaveTimers = new Map();
 
 // Debounce timers for snapshots — keyed by fileId when available, else roomId.
 const snapshotTimers = new Map();
+
+// When each file's CURRENT server-side Y.Doc instance was created. A relative
+// position encoded against an OLDER doc instance (e.g. one that existed before
+// a server restart wiped the in-memory ydocs Map) can't be trusted against a
+// freshly-rehydrated doc — it was hydrated from a flattened content string, not
+// from Yjs history, so its internal item ids are unrelated to the old ones.
+// Resolving an old anchor against it would falsely look like "text deleted".
+// Map<fileId, Date>
+const ydocCreatedAt = new Map();
+
+// Debounce timers for comment-anchor reconciliation — keyed by fileId.
+const commentReconcileTimers = new Map();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -61,6 +74,7 @@ async function getOrCreateYDoc(fileId) {
       console.error(`getOrCreateYDoc hydration error for ${fileId}:`, err.message);
     }
     ydocs.set(fileId, ydoc);
+    ydocCreatedAt.set(fileId, new Date());
     ydocLocks.delete(fileId);
     return ydoc;
   })();
@@ -122,6 +136,109 @@ function scheduleSnapshot(roomId, fileId, content, userName) {
         console.error("Snapshot error:", err.message);
       }
     }, 2000)
+  );
+}
+
+// ── Comment anchor reconciliation ─────────────────────────────────────────────
+// Keeps comments tied to their code as the document is edited, using Yjs relative
+// positions. Triggered (debounced) from every yjs-update. Only root comments with
+// a relativePos participate — replies and pre-feature comments are untouched.
+
+function decodeRelPos(base64Str) {
+  return new Uint8Array(Buffer.from(base64Str, "base64"));
+}
+
+// 1-based line number containing character `index` of `text`.
+function indexToLineNumber(text, index) {
+  let line = 1;
+  for (let i = 0; i < index && i < text.length; i++) {
+    if (text[i] === "\n") line++;
+  }
+  return line;
+}
+
+async function reconcileComments(io, roomId, fileId) {
+  try {
+    const comments = await Comment.find({ fileId, parentId: null, relativePos: { $ne: null } });
+    if (comments.length === 0) return;
+
+    const ydoc = await getOrCreateYDoc(fileId);
+    const text = ydoc.getText("content").toString();
+    const docCreatedAt = ydocCreatedAt.get(fileId);
+
+    const deletedIds = [];
+
+    for (const comment of comments) {
+      // Don't trust resolution against a Y.Doc instance that didn't exist yet when
+      // this comment's anchor was created (see ydocCreatedAt comment above) — leave
+      // lineNumber as-is rather than risk deleting a comment for no real reason.
+      if (docCreatedAt && comment.createdAt < docCreatedAt) continue;
+
+      let relPos;
+      try {
+        relPos = Y.decodeRelativePosition(decodeRelPos(comment.relativePos));
+      } catch {
+        continue; // corrupt/unreadable anchor — leave alone rather than guess
+      }
+
+      // IMPORTANT: createAbsolutePositionFromRelativePosition deliberately stays
+      // resolvable through deletions (it returns the tombstone's position, by
+      // design — e.g. so a cursor doesn't vanish when someone else deletes the
+      // character it's on). It does NOT return null just because the anchored
+      // text was deleted, so it can't be used as the deletion signal on its own
+      // (verified directly against the installed yjs version before relying on
+      // this). Instead, our anchor (created with the default, item-level assoc)
+      // references a specific character's item id — ask Yjs directly whether
+      // THAT item was deleted via Y.getItem(...).deleted, which is unambiguous.
+      if (!relPos.item) continue; // type-relative anchor, no specific item — leave alone
+
+      if (Y.getState(ydoc.store, relPos.item.client) <= relPos.item.clock) {
+        continue; // this doc hasn't integrated the update that created the anchor yet
+      }
+
+      let item;
+      try {
+        item = Y.getItem(ydoc.store, relPos.item);
+      } catch {
+        continue; // unresolvable — leave alone rather than guess
+      }
+
+      if (item.deleted) {
+        // The anchored text itself was deleted — the comment goes with it.
+        deletedIds.push(comment._id);
+        const replies = await Comment.find({ parentId: comment._id }).select("_id");
+        deletedIds.push(...replies.map((r) => r._id));
+        continue;
+      }
+
+      // Anchor's character is still alive — text just shifted (edits elsewhere,
+      // e.g. lines inserted/deleted above it). Update the stored line if it moved.
+      const abs = Y.createAbsolutePositionFromRelativePosition(relPos, ydoc);
+      if (abs === null) continue; // shouldn't happen given the alive check above — stay safe
+
+      const newLine = indexToLineNumber(text, abs.index);
+      if (newLine !== comment.lineNumber) {
+        comment.lineNumber = newLine;
+        await comment.save();
+        io.to(roomId).emit("comment-relocated", { commentId: comment._id, lineNumber: newLine });
+      }
+    }
+
+    if (deletedIds.length > 0) {
+      await Comment.deleteMany({ _id: { $in: deletedIds } });
+      io.to(roomId).emit("comment-deleted", { fileId, commentIds: deletedIds });
+    }
+  } catch (err) {
+    console.error("reconcileComments error:", err.message);
+  }
+}
+
+// Debounced (1.5s) so a burst of keystrokes triggers one reconcile pass, not one per character.
+function scheduleCommentReconcile(io, roomId, fileId) {
+  if (commentReconcileTimers.has(fileId)) clearTimeout(commentReconcileTimers.get(fileId));
+  commentReconcileTimers.set(
+    fileId,
+    setTimeout(() => reconcileComments(io, roomId, fileId), 1500)
   );
 }
 
@@ -212,6 +329,7 @@ function setupSocketHandlers(io) {
 
         scheduleFileSave(fileId, content, null, roomId);
         scheduleSnapshot(roomId, fileId, content, socket.userName);
+        scheduleCommentReconcile(io, roomId, fileId);
       } catch (err) {
         console.error("yjs-update error:", err.message);
       }
@@ -245,6 +363,7 @@ function setupSocketHandlers(io) {
         ydocs.delete(fileId);
       }
       ydocLocks.delete(fileId);
+      ydocCreatedAt.delete(fileId);
       if (fileSaveTimers.has(fileId)) {
         clearTimeout(fileSaveTimers.get(fileId));
         fileSaveTimers.delete(fileId);
@@ -252,6 +371,10 @@ function setupSocketHandlers(io) {
       if (snapshotTimers.has(fileId)) {
         clearTimeout(snapshotTimers.get(fileId));
         snapshotTimers.delete(fileId);
+      }
+      if (commentReconcileTimers.has(fileId)) {
+        clearTimeout(commentReconcileTimers.get(fileId));
+        commentReconcileTimers.delete(fileId);
       }
       socket.to(roomId).emit("file-deleted", { fileId });
     });
@@ -344,4 +467,12 @@ function setupSocketHandlers(io) {
   });
 }
 
-module.exports = { setupSocketHandlers };
+// ── Inline comments ───────────────────────────────────────────────────────────
+// Comment CRUD lives in routes/rooms.js (REST, JWT-protected, room-access checked
+// there). This just fans the resulting change out to everyone in the room over
+// the socket, same as every other broadcast in this file.
+function broadcastCommentEvent(io, roomId, event, payload) {
+  io.to(roomId).emit(event, payload);
+}
+
+module.exports = { setupSocketHandlers, broadcastCommentEvent };

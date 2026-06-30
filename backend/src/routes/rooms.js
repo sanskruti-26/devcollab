@@ -5,6 +5,8 @@ const auth = require("../middleware/auth");
 const Room = require("../models/Room");
 const File = require("../models/File");
 const Snapshot = require("../models/Snapshot");
+const Comment = require("../models/Comment");
+const { broadcastCommentEvent } = require("../services/roomService");
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -346,6 +348,151 @@ router.delete("/:roomId", auth, async (req, res) => {
     ]);
 
     res.json({ message: "Room deleted" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Inline comments ──────────────────────────────────────────────────────────
+
+// Same palette/hash approach as the live-cursor colors in RoomPage.jsx, but
+// seeded by userId (stable across sessions) instead of socketId (changes per
+// connection) so a person's threads always render in the same color.
+const CURSOR_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899", "#ef4444"];
+function colorForUser(userId) {
+  const hash = [...userId.toString()].reduce((acc, c) => acc + c.charCodeAt(0), 0);
+  return CURSOR_COLORS[hash % CURSOR_COLORS.length];
+}
+
+// GET /api/v1/rooms/:roomId/files/:fileId/comments — list all comments for a file
+router.get("/:roomId/files/:fileId/comments", auth, async (req, res) => {
+  try {
+    const room = await Room.findOne({ roomId: req.params.roomId });
+    if (!room) return res.status(404).json({ error: "Room not found" });
+    if (!hasRoomAccess(room, req.user.id))
+      return res.status(403).json({ error: "Not a member of this room" });
+
+    const comments = await Comment.find({
+      roomId: req.params.roomId,
+      fileId: req.params.fileId,
+    }).sort({ createdAt: 1 });
+
+    res.json(comments);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/v1/rooms/:roomId/files/:fileId/comments — add a comment, or a reply
+// when parentId is given. Replies inherit the thread root's lineNumber so a
+// thread always stays anchored as one unit.
+router.post("/:roomId/files/:fileId/comments", auth, async (req, res) => {
+  try {
+    const room = await Room.findOne({ roomId: req.params.roomId });
+    if (!room) return res.status(404).json({ error: "Room not found" });
+    if (!hasRoomAccess(room, req.user.id))
+      return res.status(403).json({ error: "Not a member of this room" });
+
+    const { lineNumber, text, parentId, relativePos } = req.body;
+    if (!text?.trim()) return res.status(400).json({ error: "Comment text required" });
+
+    let resolvedLineNumber = lineNumber;
+
+    if (parentId) {
+      const parent = await Comment.findOne({
+        _id: parentId,
+        roomId: req.params.roomId,
+        fileId: req.params.fileId,
+      });
+      if (!parent) return res.status(404).json({ error: "Parent comment not found" });
+      if (parent.parentId)
+        return res.status(400).json({ error: "Reply on the thread's root comment, not another reply" });
+      resolvedLineNumber = parent.lineNumber;
+    } else if (!lineNumber || lineNumber < 1) {
+      return res.status(400).json({ error: "lineNumber required to start a new thread" });
+    }
+
+    const comment = await Comment.create({
+      roomId: req.params.roomId,
+      fileId: req.params.fileId,
+      lineNumber: resolvedLineNumber,
+      userId: req.user.id,
+      userName: req.user.name,
+      userColor: colorForUser(req.user.id),
+      text: text.trim(),
+      parentId: parentId || null,
+      // Only root comments get a live anchor — replies just follow their root's line.
+      relativePos: parentId ? null : (relativePos || null),
+    });
+
+    broadcastCommentEvent(req.app.get("io"), req.params.roomId, "comment-created", comment);
+
+    res.status(201).json(comment);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/v1/rooms/:roomId/comments/:commentId/resolve — toggle (or set)
+// resolved state. Only a thread's root comment can be resolved — resolving
+// collapses the whole thread, replies don't have their own resolved state.
+router.patch("/:roomId/comments/:commentId/resolve", auth, async (req, res) => {
+  try {
+    const room = await Room.findOne({ roomId: req.params.roomId });
+    if (!room) return res.status(404).json({ error: "Room not found" });
+    if (!hasRoomAccess(room, req.user.id))
+      return res.status(403).json({ error: "Not a member of this room" });
+
+    const comment = await Comment.findOne({ _id: req.params.commentId, roomId: req.params.roomId });
+    if (!comment) return res.status(404).json({ error: "Comment not found" });
+    if (comment.parentId)
+      return res.status(400).json({ error: "Only the thread's root comment can be resolved" });
+
+    comment.resolved = typeof req.body.resolved === "boolean" ? req.body.resolved : !comment.resolved;
+    await comment.save();
+
+    broadcastCommentEvent(req.app.get("io"), req.params.roomId, "comment-resolved", {
+      commentId: comment._id,
+      resolved: comment.resolved,
+    });
+
+    res.json(comment);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/v1/rooms/:roomId/comments/:commentId — author or room owner only.
+// Deleting a thread root cascades to its replies so nothing is orphaned.
+router.delete("/:roomId/comments/:commentId", auth, async (req, res) => {
+  try {
+    const room = await Room.findOne({ roomId: req.params.roomId });
+    if (!room) return res.status(404).json({ error: "Room not found" });
+    if (!hasRoomAccess(room, req.user.id))
+      return res.status(403).json({ error: "Not a member of this room" });
+
+    const comment = await Comment.findOne({ _id: req.params.commentId, roomId: req.params.roomId });
+    if (!comment) return res.status(404).json({ error: "Comment not found" });
+
+    const isAuthor = comment.userId.toString() === req.user.id;
+    const isOwner = room.owner.toString() === req.user.id;
+    if (!isAuthor && !isOwner)
+      return res.status(403).json({ error: "Only the author or room owner can delete this comment" });
+
+    let deletedIds = [comment._id];
+    if (!comment.parentId) {
+      const replies = await Comment.find({ parentId: comment._id }).select("_id");
+      deletedIds = deletedIds.concat(replies.map((r) => r._id));
+    }
+
+    await Comment.deleteMany({ _id: { $in: deletedIds } });
+
+    broadcastCommentEvent(req.app.get("io"), req.params.roomId, "comment-deleted", {
+      fileId: comment.fileId,
+      commentIds: deletedIds,
+    });
+
+    res.json({ message: "Comment deleted", commentIds: deletedIds });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
