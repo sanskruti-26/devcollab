@@ -41,15 +41,6 @@ const fileSaveTimers = new Map();
 // Debounce timers for snapshots — keyed by fileId when available, else roomId.
 const snapshotTimers = new Map();
 
-// When each file's CURRENT server-side Y.Doc instance was created. A relative
-// position encoded against an OLDER doc instance (e.g. one that existed before
-// a server restart wiped the in-memory ydocs Map) can't be trusted against a
-// freshly-rehydrated doc — it was hydrated from a flattened content string, not
-// from Yjs history, so its internal item ids are unrelated to the old ones.
-// Resolving an old anchor against it would falsely look like "text deleted".
-// Map<fileId, Date>
-const ydocCreatedAt = new Map();
-
 // Debounce timers for comment-anchor reconciliation — keyed by fileId.
 const commentReconcileTimers = new Map();
 
@@ -68,16 +59,21 @@ async function getOrCreateYDoc(fileId) {
     const ydoc = new Y.Doc();
     try {
       const file = await File.findById(fileId);
-      if (file?.content) {
+      if (file?.yjsState?.length) {
+        // Preferred path: replay the actual CRDT state, so item identities (and
+        // therefore existing comment relative-position anchors) survive a restart.
+        Y.applyUpdate(ydoc, file.yjsState, "hydrate");
+      } else if (file?.content) {
+        // Back-compat fallback for files saved before yjsState existed — seeds
+        // readable text but with brand-new item identities. Any relative position
+        // anchored against the old (lost) doc state can never resolve against
+        // this one; see the migration note in models/File.js.
         ydoc.getText("content").insert(0, file.content);
       }
-      // TEMP DEBUG (remove after diagnosing comment-anchor issue):
-      console.log(`[reconcile-debug] getOrCreateYDoc COLD START fileId=${fileId} contentLen=${file?.content?.length ?? 0} at=${new Date().toISOString()}`);
     } catch (err) {
       console.error(`getOrCreateYDoc hydration error for ${fileId}:`, err.message);
     }
     ydocs.set(fileId, ydoc);
-    ydocCreatedAt.set(fileId, new Date());
     ydocLocks.delete(fileId);
     return ydoc;
   })();
@@ -102,14 +98,16 @@ async function broadcastFilePresence(io, roomId) {
   }
 }
 
-// Debounced save of a single File document (5 s).
-function scheduleFileSave(fileId, content, language, roomId) {
+// Debounced save of a single File document (5 s). Persists both the readable
+// plaintext (for the file tree, downloads, snapshots) and the encoded Yjs state
+// (for rehydrating the CRDT itself on the next cold start — see getOrCreateYDoc).
+function scheduleFileSave(fileId, content, yjsState, language, roomId) {
   if (fileSaveTimers.has(fileId)) clearTimeout(fileSaveTimers.get(fileId));
   fileSaveTimers.set(
     fileId,
     setTimeout(async () => {
       try {
-        const update = { content, $inc: { version: 1 } };
+        const update = { content, yjsState: Buffer.from(yjsState), $inc: { version: 1 } };
         if (language) update.language = language;
         await File.findByIdAndUpdate(fileId, update);
         console.log(`Auto-saved file ${fileId} (room ${roomId})`);
@@ -163,31 +161,18 @@ function indexToLineNumber(text, index) {
 async function reconcileComments(io, roomId, fileId) {
   try {
     const comments = await Comment.find({ fileId, parentId: null, relativePos: { $ne: null } });
-    // TEMP DEBUG (remove after diagnosing comment-anchor issue):
-    console.log(`[reconcile-debug] RUN fileId=${fileId} roomId=${roomId} commentsChecked=${comments.length} at=${new Date().toISOString()}`);
     if (comments.length === 0) return;
 
     const ydoc = await getOrCreateYDoc(fileId);
     const text = ydoc.getText("content").toString();
-    const docCreatedAt = ydocCreatedAt.get(fileId);
-    console.log(`[reconcile-debug] docCreatedAt=${docCreatedAt?.toISOString()}`);
 
     const deletedIds = [];
 
     for (const comment of comments) {
-      // Don't trust resolution against a Y.Doc instance that didn't exist yet when
-      // this comment's anchor was created (see ydocCreatedAt comment above) — leave
-      // lineNumber as-is rather than risk deleting a comment for no real reason.
-      if (docCreatedAt && comment.createdAt < docCreatedAt) {
-        console.log(`[reconcile-debug] comment=${comment._id} SKIPPED stale-doc-guard (comment.createdAt=${comment.createdAt.toISOString()} < docCreatedAt=${docCreatedAt.toISOString()})`);
-        continue;
-      }
-
       let relPos;
       try {
         relPos = Y.decodeRelativePosition(decodeRelPos(comment.relativePos));
-      } catch (err) {
-        console.log(`[reconcile-debug] comment=${comment._id} SKIPPED corrupt-anchor: ${err.message}`);
+      } catch {
         continue; // corrupt/unreadable anchor — leave alone rather than guess
       }
 
@@ -200,27 +185,21 @@ async function reconcileComments(io, roomId, fileId) {
       // this). Instead, our anchor (created with the default, item-level assoc)
       // references a specific character's item id — ask Yjs directly whether
       // THAT item was deleted via Y.getItem(...).deleted, which is unambiguous.
-      if (!relPos.item) {
-        console.log(`[reconcile-debug] comment=${comment._id} SKIPPED type-relative-anchor (no item)`);
-        continue; // type-relative anchor, no specific item — leave alone
-      }
+      if (!relPos.item) continue; // type-relative anchor, no specific item — leave alone
 
       if (Y.getState(ydoc.store, relPos.item.client) <= relPos.item.clock) {
-        console.log(`[reconcile-debug] comment=${comment._id} SKIPPED doc-state-behind-anchor (client=${relPos.item.client} clock=${relPos.item.clock} docState=${Y.getState(ydoc.store, relPos.item.client)})`);
         continue; // this doc hasn't integrated the update that created the anchor yet
       }
 
       let item;
       try {
         item = Y.getItem(ydoc.store, relPos.item);
-      } catch (err) {
-        console.log(`[reconcile-debug] comment=${comment._id} SKIPPED unresolvable-item: ${err.message}`);
+      } catch {
         continue; // unresolvable — leave alone rather than guess
       }
 
       if (item.deleted) {
         // The anchored text itself was deleted — the comment goes with it.
-        console.log(`[reconcile-debug] comment=${comment._id} RESOLVED -> item.deleted=true, deleting comment+replies`);
         deletedIds.push(comment._id);
         const replies = await Comment.find({ parentId: comment._id }).select("_id");
         deletedIds.push(...replies.map((r) => r._id));
@@ -230,13 +209,9 @@ async function reconcileComments(io, roomId, fileId) {
       // Anchor's character is still alive — text just shifted (edits elsewhere,
       // e.g. lines inserted/deleted above it). Update the stored line if it moved.
       const abs = Y.createAbsolutePositionFromRelativePosition(relPos, ydoc);
-      if (abs === null) {
-        console.log(`[reconcile-debug] comment=${comment._id} RESOLVED -> null (unexpected given alive check)`);
-        continue; // shouldn't happen given the alive check above — stay safe
-      }
+      if (abs === null) continue; // shouldn't happen given the alive check above — stay safe
 
       const newLine = indexToLineNumber(text, abs.index);
-      console.log(`[reconcile-debug] comment=${comment._id} RESOLVED -> alive, index=${abs.index}, oldLine=${comment.lineNumber}, newLine=${newLine}`);
       if (newLine !== comment.lineNumber) {
         comment.lineNumber = newLine;
         await comment.save();
@@ -354,8 +329,9 @@ function setupSocketHandlers(io) {
 
         // Read merged text for persistence (pure CRDT result, no last-write-wins)
         const content = ydoc.getText("content").toString();
+        const yjsState = Y.encodeStateAsUpdate(ydoc);
 
-        scheduleFileSave(fileId, content, null, roomId);
+        scheduleFileSave(fileId, content, yjsState, null, roomId);
         scheduleSnapshot(roomId, fileId, content, socket.userName);
         scheduleCommentReconcile(io, roomId, fileId);
       } catch (err) {
@@ -391,7 +367,6 @@ function setupSocketHandlers(io) {
         ydocs.delete(fileId);
       }
       ydocLocks.delete(fileId);
-      ydocCreatedAt.delete(fileId);
       if (fileSaveTimers.has(fileId)) {
         clearTimeout(fileSaveTimers.get(fileId));
         fileSaveTimers.delete(fileId);
