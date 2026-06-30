@@ -13,6 +13,13 @@ const fileSchema = new mongoose.Schema(
       enum: ["javascript", "typescript", "python", "java", "cpp"],
     },
     content: { type: String, default: "" },
+    // Encoded Yjs document state (Y.encodeStateAsUpdate), persisted alongside the
+    // plaintext `content` so the server can rehydrate the CRDT's item identities
+    // after a restart instead of just its visible text. Without this, relative
+    // positions (e.g. comment anchors) created against the pre-restart Y.Doc can
+    // never resolve against a freshly-seeded one. Null for files saved before this
+    // field existed — those fall back to plaintext seeding on next cold start.
+    yjsState: { type: Buffer, default: null },
     // Incremented on every saved code-change — used in Stage 2 for stale-write detection
     version: { type: Number, default: 0 },
   },
