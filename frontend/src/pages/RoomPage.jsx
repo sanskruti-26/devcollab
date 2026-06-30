@@ -360,12 +360,28 @@ export default function RoomPage() {
     socketSetup.current = true;
 
     socket.on("connect", () => {
-      socket.emit("join-room", { roomId, userName: user?.name || "Anonymous" });
+      // No userName in the payload — the server derives identity from the
+      // verified JWT sent during the handshake (socket.user), not from
+      // whatever a client claims here.
+      socket.emit("join-room", { roomId });
       // Only re-request Yjs state on RECONNECTION — when ydocRef is already
       // set (editor was mounted before the drop). On initial connect ydocRef
       // is null; handleEditorMount fires shortly after and requests sync then.
       if (activeFileIdRef.current && ydocRef.current) {
         socket.emit("yjs-sync-request", { roomId, fileId: activeFileIdRef.current });
+      }
+    });
+
+    // Handshake-level auth failure (missing/expired token) — mirrors the axios
+    // 401 interceptor in lib/api.js: drop the stale session and send the user
+    // back to login instead of silently failing to sync.
+    socket.on("connect_error", (err) => {
+      if (err.message === "No token provided" || err.message === "Invalid or expired token") {
+        localStorage.removeItem("token");
+        localStorage.removeItem("user");
+        navigate("/login");
+      } else {
+        addToast("Connection lost — retrying...");
       }
     });
 
@@ -863,7 +879,9 @@ export default function RoomPage() {
     const code = ydocRef.current?.getText("content").toString() ?? "";
     setRunningBy(name);
     setRunOutput(null);
-    socket.emit("run-start", { roomId, runnerName: name });
+    // No runnerName in the payload — the server broadcasts socket.userName
+    // (verified at join) so a client can't claim someone else ran the code.
+    socket.emit("run-start", { roomId });
 
     async function attempt() {
       const { data } = await api.post("/api/v1/rooms/execute", { code, language });
@@ -887,7 +905,7 @@ export default function RoomPage() {
       }
       setRunningBy(null);
       setRunOutput({ output, by: name });
-      socket.emit("run-result", { roomId, output, runnerName: name });
+      socket.emit("run-result", { roomId, output });
     } catch (err) {
       const status    = err.response?.status;
       const serverMsg = err.response?.data?.error || "";
@@ -901,7 +919,7 @@ export default function RoomPage() {
       }
       setRunningBy(null);
       setRunOutput({ output, by: name });
-      socket.emit("run-result", { roomId, output, runnerName: name });
+      socket.emit("run-result", { roomId, output });
     }
   }
 

@@ -18,6 +18,7 @@ const File   = require("../models/File");
 const Message  = require("../models/Message");
 const Snapshot = require("../models/Snapshot");
 const Comment  = require("../models/Comment");
+const socketAuthMiddleware = require("../middleware/socketAuth");
 
 // ── In-memory caches ──────────────────────────────────────────────────────────
 
@@ -245,14 +246,22 @@ function scheduleCommentReconcile(io, roomId, fileId) {
 // ── Socket handlers ───────────────────────────────────────────────────────────
 
 function setupSocketHandlers(io) {
+  // Runs before any "connection" listener — rejects the handshake outright if
+  // the JWT is missing or invalid, so unauthenticated sockets never reach
+  // room logic at all (previously only the REST API checked the token).
+  io.use(socketAuthMiddleware);
+
   io.on("connection", (socket) => {
-    console.log(`Socket connected: ${socket.id}`);
+    console.log(`Socket connected: ${socket.id} (user ${socket.user.id})`);
 
     // ── join-room ─────────────────────────────────────────────────────────────
-    socket.on("join-room", async ({ roomId, userName }) => {
+    // Identity comes from the verified JWT (socket.user), not the client
+    // payload — a client can no longer claim to be someone else by passing a
+    // different userName.
+    socket.on("join-room", async ({ roomId }) => {
       socket.join(roomId);
       socket.roomId   = roomId;
-      socket.userName = userName || "Anonymous";
+      socket.userName = socket.user.name;
 
       console.log(`${socket.userName} joined room ${roomId}`);
 
@@ -423,13 +432,15 @@ function setupSocketHandlers(io) {
     });
 
     // ── Code execution ────────────────────────────────────────────────────────
+    // runnerName comes from socket.userName (verified at join), not the client
+    // payload — otherwise any client could claim someone else ran the code.
 
-    socket.on("run-start", ({ roomId, runnerName }) => {
-      io.to(roomId).emit("run-start", { runnerName });
+    socket.on("run-start", ({ roomId }) => {
+      io.to(roomId).emit("run-start", { runnerName: socket.userName });
     });
 
-    socket.on("run-result", ({ roomId, output, runnerName }) => {
-      io.to(roomId).emit("run-result", { output, runnerName });
+    socket.on("run-result", ({ roomId, output }) => {
+      io.to(roomId).emit("run-result", { output, runnerName: socket.userName });
     });
 
     // ── Typing indicators ─────────────────────────────────────────────────────
