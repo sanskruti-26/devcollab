@@ -10,9 +10,42 @@
 // All legacy events (code-change, code-update, init-code, init-file, join-file) have been
 // removed — any client still sending them is too old to join correctly and should hard-refresh.
 //
+// State ownership (multi-instance): the per-instance `ydocs` Map below is a
+// LOCAL computation cache, not a shared source of truth — Yjs needs a live
+// Y.Doc object to merge updates against, but each instance behind the load
+// balancer has its own. Three things keep every instance's copy converged:
+//   - Redis pub/sub channel `yjs:updates:{fileId}` — every yjs-update is
+//     re-published here as its raw diff (not the full doc state) right after
+//     being merged locally. Every instance that has the file open subscribes
+//     to this channel and applies incoming diffs to its own local Y.Doc via
+//     Y.applyUpdate. Because Yjs updates are commutative (merge order doesn't
+//     change the converged result) and idempotent (re-applying an update
+//     already merged is a safe no-op), this is enough for every instance's
+//     doc to converge to the same content regardless of which instance
+//     handled which keystroke — unlike overwriting a single shared "latest
+//     state" value, which would silently drop whichever edit lost the race.
+//   - Redis stream `yjs:updates:{fileId}` (same name as the pub/sub channel —
+//     Redis's pub/sub namespace and keyspace are independent, so this is
+//     safe) — every publish is ALSO XADD'd here, trimmed to the most recent
+//     STREAM_MAXLEN entries. Pub/sub alone has a gap: SUBSCRIBE is an async
+//     round trip, so an instance that's cold-starting a file can lose a race
+//     against a PUBLISH from another, already-warm instance and miss that
+//     diff forever (no backlog). Right after subscribing, a cold-starting
+//     instance also reads this stream's entire (bounded) backlog and applies
+//     every entry — since applyUpdate is idempotent, it's safe even for
+//     entries also delivered live via pub/sub, and it guarantees nothing
+//     published around cold-start time is lost regardless of which side of
+//     the SUBSCRIBE-vs-PUBLISH race actually won.
+//   - Redis key `yjs:state:{fileId}` — a full encoded snapshot, refreshed on
+//     the same 5s debounce as the MongoDB save (see scheduleFileSave). This
+//     is the cheap baseline for cold-start hydration, covering everything
+//     older than the trimmed stream above can reach. MongoDB remains the
+//     durable, restart-survivable copy, same as before.
+//
 // Session replay: snapshots full content strings read from Y.Doc after each merged write.
 
 const Y      = require("yjs");
+const { createClient, commandOptions } = require("redis");
 const Room   = require("../models/Room");
 const File   = require("../models/File");
 const Message  = require("../models/Message");
@@ -20,10 +53,151 @@ const Snapshot = require("../models/Snapshot");
 const Comment  = require("../models/Comment");
 const socketAuthMiddleware = require("../middleware/socketAuth");
 
+// Redis is optional here, same convention as attachRedisAdapter() in
+// server.js: only connects when REDIS_URL is set (multi-instance deployments,
+// or docker-compose). Without it every helper below is a no-op and this file
+// behaves exactly as it did before Redis was introduced — a single local
+// Y.Doc per file, Mongo-backed — so plain `npm run dev` doesn't need Redis
+// running and doesn't spam reconnect-error logs for a feature it's not using.
+const REDIS_URL = process.env.REDIS_URL;
+
+// Regular client: GET/SET the cold-start snapshot key, PUBLISH diffs.
+const redisClient = REDIS_URL ? createClient({ url: REDIS_URL }) : null;
+if (redisClient) {
+  redisClient.on("error", (err) => console.error("Redis client error (roomService):", err.message));
+  redisClient.connect().catch((err) => console.error("Redis connect error (roomService):", err.message));
+}
+
+// Separate dedicated connection for SUBSCRIBE: once a node-redis client
+// subscribes to a channel it can only be used for subscribe/unsubscribe, so
+// it can't share a connection with the GET/SET/PUBLISH calls above (this is
+// the same pub/sub-client-vs-command-client split the socket.io-redis-adapter
+// itself uses).
+const redisSubscriber = redisClient ? redisClient.duplicate() : null;
+if (redisSubscriber) {
+  redisSubscriber.on("error", (err) => console.error("Redis subscriber error (roomService):", err.message));
+  redisSubscriber.connect().catch((err) => console.error("Redis subscriber connect error (roomService):", err.message));
+}
+
+function redisSnapshotKey(fileId) {
+  return `yjs:state:${fileId}`;
+}
+
+// Names BOTH the pub/sub channel and the Redis Stream key for a file's
+// updates — see the state-ownership comment above for why one name safely
+// serves double duty here.
+function redisUpdatesKey(fileId) {
+  return `yjs:updates:${fileId}`;
+}
+
+// Field name for the diff bytes within each stream entry.
+const STREAM_UPDATE_FIELD = "update";
+// Bounds each file's replay buffer — it only needs to cover "however long a
+// cold start can take", not the file's whole edit history (Mongo/the
+// snapshot key already own that).
+const STREAM_MAXLEN = 1000;
+
+// Reads the cold-start snapshot for a file back out as a Buffer — this is
+// opaque binary CRDT data, not text, so it must round-trip with bufferMode.
+async function getRedisSnapshot(fileId) {
+  if (!redisClient) return null;
+  return redisClient.get(commandOptions({ returnBuffers: true }), redisSnapshotKey(fileId));
+}
+
+// Overwrites the cold-start snapshot with the doc's current full state. Only
+// called from the 5s debounce in scheduleFileSave and from first-hydration —
+// NEVER from the per-keystroke yjs-update path, since two instances racing
+// to SET this key is exactly the overwrite bug this design avoids.
+async function writeRedisSnapshot(fileId, encodedState) {
+  if (!redisClient) return;
+  try {
+    await redisClient.set(redisSnapshotKey(fileId), Buffer.from(encodedState));
+  } catch (err) {
+    console.error(`writeRedisSnapshot error for ${fileId}:`, err.message);
+  }
+}
+
+// Broadcasts one merged update's diff to every other instance — live, via
+// Redis pub/sub, AND durably (bounded), via a Redis Stream, so a
+// cold-starting instance can catch up on it even if it loses the timing race
+// against the pub/sub side (see subscribeToFileUpdates / catchUpFromStream).
+async function publishUpdateDiff(fileId, update) {
+  if (!redisClient) return;
+  const key = redisUpdatesKey(fileId);
+  try {
+    await Promise.all([
+      redisClient.publish(key, Buffer.from(update)),
+      redisClient.xAdd(key, "*", { [STREAM_UPDATE_FIELD]: Buffer.from(update) }, {
+        TRIM: { strategy: "MAXLEN", strategyModifier: "~", threshold: STREAM_MAXLEN },
+      }),
+    ]);
+  } catch (err) {
+    console.error(`publishUpdateDiff error for ${fileId}:`, err.message);
+  }
+}
+
+// Subscribes this instance to another file's update channel so its local
+// Y.Doc stays converged with every other instance's edits. Called once per
+// fileId per instance, from getOrCreateYDoc's cold-start path.
+//
+// We do NOT tag messages with an instance id to filter out our own — an
+// instance that published a diff will also receive it back here (Redis
+// pub/sub delivers to every subscriber, publisher included). Re-applying it
+// is a safe no-op (Yjs dedupes by item id/clock), so filtering would only
+// save one cheap no-op merge per keystroke, at the cost of a second
+// correctness mechanism layered on top of the idempotency we already have to
+// rely on anyway (pub/sub gives no ordering/delivery guarantees across
+// instances, so convergence always depends on Yjs's commutativity, tagging
+// or not).
+async function subscribeToFileUpdates(fileId) {
+  if (!redisSubscriber) return;
+  try {
+    await redisSubscriber.subscribe(
+      redisUpdatesKey(fileId),
+      (message) => {
+        const ydoc = ydocs.get(fileId);
+        if (ydoc) Y.applyUpdate(ydoc, message, "redis-pubsub");
+      },
+      true // bufferMode: deliver the raw binary diff, not a decoded string
+    );
+  } catch (err) {
+    console.error(`subscribeToFileUpdates error for ${fileId}:`, err.message);
+  }
+}
+
+// Reads this file's entire (bounded) replay buffer and applies every entry.
+// Called once per fileId per instance, right after subscribeToFileUpdates,
+// from getOrCreateYDoc's cold-start path. This is what actually closes the
+// SUBSCRIBE-vs-PUBLISH race: SUBSCRIBE is an async round trip, so a diff
+// published by another (already-warm) instance can reach Redis before our
+// subscription is registered there, and pub/sub has no backlog to deliver it
+// late. The stream does — whatever the live subscription missed, this read
+// still finds, and re-applying entries the subscription DID catch is a safe
+// no-op (Y.applyUpdate is idempotent).
+async function catchUpFromStream(fileId, ydoc) {
+  if (!redisClient) return;
+  try {
+    const entries = await redisClient.xRange(
+      commandOptions({ returnBuffers: true }),
+      redisUpdatesKey(fileId),
+      "-",
+      "+"
+    );
+    for (const entry of entries) {
+      const bytes = entry.message[STREAM_UPDATE_FIELD];
+      if (bytes?.length) Y.applyUpdate(ydoc, bytes, "redis-stream");
+    }
+  } catch (err) {
+    console.error(`catchUpFromStream error for ${fileId}:`, err.message);
+  }
+}
+
 // ── In-memory caches ──────────────────────────────────────────────────────────
 
-// Server-side Y.Doc per file. Bootstrapped from DB on first access.
-// Map<fileId (string), Y.Doc>
+// Server-side Y.Doc per file — a LOCAL cache, not the source of truth. Kept
+// converged with other instances via the Redis pub/sub channel above.
+// Bootstrapped from the Redis snapshot (falling back to MongoDB) on first
+// access on this instance. Map<fileId (string), Y.Doc>
 const ydocs = new Map();
 
 // Creation locks — Map<fileId, Promise<Y.Doc>>.
@@ -46,34 +220,63 @@ const commentReconcileTimers = new Map();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// Returns the server-side Y.Doc for a file.
-// Hot path (doc already created): synchronous map lookup, no await cost.
-// Cold path (first access): creates exactly ONE Y.Doc, hydrates it from DB, then
-// caches it. Any concurrent cold calls share the same creation promise so they all
-// await the same hydrated doc — preventing the duplicate-clientID bug.
+// Returns the server-side Y.Doc for a file, LOCAL to this instance.
+// Hot path (doc already created on this instance): synchronous map lookup,
+// no await cost — kept current in the background by the Redis pub/sub
+// subscription set up below, not by re-fetching anything here.
+// Cold path (first access on this instance): creates exactly ONE Y.Doc,
+// registers it and subscribes to this file's update channel FIRST, THEN
+// hydrates it from the Redis snapshot (falling back to MongoDB if Redis has
+// nothing cached yet). That order matters: if we hydrated before subscribing,
+// any diff another instance published in the gap between "we read the
+// snapshot" and "we started listening" would be lost forever — pub/sub has
+// no backlog, a message published before you subscribe never arrives late.
+// Subscribing first means every diff from that point on lands on the same
+// doc object hydration is about to mutate; Y.applyUpdate is commutative, so
+// it doesn't matter whether a concurrent diff is applied before or after the
+// snapshot replay. Any concurrent cold calls share the same creation promise
+// so they all await the same hydrated doc — preventing the duplicate-clientID
+// bug.
 async function getOrCreateYDoc(fileId) {
   if (ydocs.has(fileId)) return ydocs.get(fileId);
   if (ydocLocks.has(fileId)) return ydocLocks.get(fileId);
 
   const promise = (async () => {
     const ydoc = new Y.Doc();
+    ydocs.set(fileId, ydoc);
+    await subscribeToFileUpdates(fileId);
+    // Closes the SUBSCRIBE-vs-PUBLISH race described above — must run after
+    // subscribing (so live delivery is also active) but works regardless of
+    // which one actually wins the race, since applyUpdate is idempotent.
+    await catchUpFromStream(fileId, ydoc);
     try {
-      const file = await File.findById(fileId);
-      if (file?.yjsState?.length) {
-        // Preferred path: replay the actual CRDT state, so item identities (and
-        // therefore existing comment relative-position anchors) survive a restart.
-        Y.applyUpdate(ydoc, file.yjsState, "hydrate");
-      } else if (file?.content) {
-        // Back-compat fallback for files saved before yjsState existed — seeds
-        // readable text but with brand-new item identities. Any relative position
-        // anchored against the old (lost) doc state can never resolve against
-        // this one; see the migration note in models/File.js.
-        ydoc.getText("content").insert(0, file.content);
+      const cached = await getRedisSnapshot(fileId);
+      if (cached?.length) {
+        // Preferred path: another instance (or this one, before a restart)
+        // already refreshed the snapshot — trust it over Mongo, which only
+        // catches up every 5s via scheduleFileSave.
+        Y.applyUpdate(ydoc, cached, "hydrate");
+      } else {
+        const file = await File.findById(fileId);
+        if (file?.yjsState?.length) {
+          // Preferred DB path: replay the actual CRDT state, so item identities
+          // (and therefore existing comment relative-position anchors) survive
+          // a restart.
+          Y.applyUpdate(ydoc, file.yjsState, "hydrate");
+        } else if (file?.content) {
+          // Back-compat fallback for files saved before yjsState existed — seeds
+          // readable text but with brand-new item identities. Any relative position
+          // anchored against the old (lost) doc state can never resolve against
+          // this one; see the migration note in models/File.js.
+          ydoc.getText("content").insert(0, file.content);
+        }
+        // Seed the snapshot so the next cold start (this instance restarting,
+        // or another instance opening the file) doesn't have to hit Mongo.
+        if (file) await writeRedisSnapshot(fileId, Y.encodeStateAsUpdate(ydoc));
       }
     } catch (err) {
       console.error(`getOrCreateYDoc hydration error for ${fileId}:`, err.message);
     }
-    ydocs.set(fileId, ydoc);
     ydocLocks.delete(fileId);
     return ydoc;
   })();
@@ -101,6 +304,9 @@ async function broadcastFilePresence(io, roomId) {
 // Debounced save of a single File document (5 s). Persists both the readable
 // plaintext (for the file tree, downloads, snapshots) and the encoded Yjs state
 // (for rehydrating the CRDT itself on the next cold start — see getOrCreateYDoc).
+// Also refreshes the Redis cold-start snapshot on this same debounce — NOT on
+// every yjs-update, since two instances racing to overwrite that key per
+// keystroke is exactly the race the pub/sub channel above exists to avoid.
 function scheduleFileSave(fileId, content, yjsState, language, roomId) {
   if (fileSaveTimers.has(fileId)) clearTimeout(fileSaveTimers.get(fileId));
   fileSaveTimers.set(
@@ -114,6 +320,7 @@ function scheduleFileSave(fileId, content, yjsState, language, roomId) {
       } catch (err) {
         console.error("File auto-save error:", err.message);
       }
+      await writeRedisSnapshot(fileId, yjsState);
     }, 5000)
   );
 }
@@ -311,7 +518,10 @@ function setupSocketHandlers(io) {
     // Client sends an incremental Yjs update (result of a local edit).
     // Socket.io delivers the Uint8Array as a Node.js Buffer on the server.
     // We apply it to the server-side Y.Doc, relay the same Buffer to all
-    // other sockets, then schedule a DB save and a full-content snapshot.
+    // other sockets in this room (across instances too, via the
+    // socket.io-redis-adapter), publish the diff to every OTHER instance's
+    // local Y.Doc for this file (via Redis pub/sub), then schedule a DB save
+    // and a full-content snapshot.
     socket.on("yjs-update", async ({ roomId, fileId, update }) => {
       if (!fileId || !update) return;
 
@@ -326,6 +536,13 @@ function setupSocketHandlers(io) {
         // Relay the raw Buffer to every OTHER socket in the room.
         // Socket.io re-wraps it as binary for the receiving browsers.
         socket.to(roomId).emit("yjs-update", { fileId, update });
+
+        // Fan the same diff out to every other backend instance so their
+        // local Y.Docs for this file converge too — see subscribeToFileUpdates.
+        // Deliberately NOT a full-state overwrite: two instances doing that
+        // concurrently would race, and whichever SET landed last would
+        // silently discard the other instance's edit.
+        await publishUpdateDiff(fileId, update);
 
         // Read merged text for persistence (pure CRDT result, no last-write-wins)
         const content = ydoc.getText("content").toString();
@@ -361,12 +578,28 @@ function setupSocketHandlers(io) {
     });
 
     socket.on("announce-file-deleted", ({ roomId, fileId }) => {
-      // Clean up Y.Doc and all in-memory state for this file
+      // Clean up Y.Doc and all in-memory state for this file, on this instance...
       if (ydocs.has(fileId)) {
         ydocs.get(fileId).destroy();
         ydocs.delete(fileId);
       }
       ydocLocks.delete(fileId);
+      // ...and the Redis-side state: stop listening for this file's diffs, and
+      // drop the cold-start snapshot AND the replay stream so neither can
+      // resurrect a deleted file for some other instance that opens it next.
+      if (redisSubscriber) {
+        redisSubscriber.unsubscribe(redisUpdatesKey(fileId)).catch((err) =>
+          console.error(`Redis unsubscribe error for ${fileId}:`, err.message)
+        );
+      }
+      if (redisClient) {
+        redisClient.del(redisUpdatesKey(fileId)).catch((err) =>
+          console.error(`Redis stream cleanup error for ${fileId}:`, err.message)
+        );
+        redisClient.del(redisSnapshotKey(fileId)).catch((err) =>
+          console.error(`Redis snapshot cleanup error for ${fileId}:`, err.message)
+        );
+      }
       if (fileSaveTimers.has(fileId)) {
         clearTimeout(fileSaveTimers.get(fileId));
         fileSaveTimers.delete(fileId);

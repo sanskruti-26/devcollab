@@ -5,6 +5,8 @@ require("dotenv").config();
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
+const { createAdapter } = require("@socket.io/redis-adapter");
+const { createClient } = require("redis");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const rateLimit = require("express-rate-limit");
@@ -65,10 +67,28 @@ app.get("/health", (req, res) => res.json({ status: "ok" }));
 // Socket.io real-time handlers
 setupSocketHandlers(io);
 
-// Connect to MongoDB then start server
+// Socket.io's default adapter only broadcasts to sockets connected to the SAME
+// process. Running more than one backend instance behind a load balancer (see
+// docker-compose.yml) means io.to()/socket.to() would silently drop events
+// bound for a socket on another instance — two users landing on different
+// instances would never see each other's edits. The Redis adapter relays every
+// broadcast through Redis pub/sub so all instances receive it. Optional: only
+// attaches when REDIS_URL is set, so single-instance local dev (`npm run dev`
+// without Redis running) still works with the default in-memory adapter.
+async function attachRedisAdapter() {
+  if (!process.env.REDIS_URL) return;
+  const pubClient = createClient({ url: process.env.REDIS_URL });
+  const subClient = pubClient.duplicate();
+  pubClient.on("error", (err) => console.error("Redis pub client error:", err.message));
+  subClient.on("error", (err) => console.error("Redis sub client error:", err.message));
+  await Promise.all([pubClient.connect(), subClient.connect()]);
+  io.adapter(createAdapter(pubClient, subClient));
+  console.log("Socket.io Redis adapter connected");
+}
+
+// Connect to MongoDB + (optionally) Redis, then start server
 const PORT = process.env.PORT || 5000;
-mongoose
-  .connect(process.env.MONGODB_URI)
+Promise.all([mongoose.connect(process.env.MONGODB_URI), attachRedisAdapter()])
   .then(() => {
     console.log("Connected to MongoDB");
     server.listen(PORT, () => {
@@ -76,6 +96,6 @@ mongoose
     });
   })
   .catch((err) => {
-    console.error("MongoDB connection error:", err.message);
+    console.error("Startup error:", err.message);
     process.exit(1);
   });
