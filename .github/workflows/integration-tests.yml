@@ -37,19 +37,17 @@ jobs:
         working-directory: backend
         run: npm ci
 
-      # Same command jest's globalSetup runs locally (see
-      # backend/tests/integration/globalSetup.js) — done as its own step here
-      # so a failure to bring the stack up shows as a distinct, obviously-infra
-      # CI failure rather than being buried inside a Jest error trace.
-      - name: Bring up multi-instance test stack (mongo, redis, backend1, backend2)
-        run: docker compose up -d --build mongo redis backend1 backend2
-
-      # jest.integration.config.js's own globalSetup/globalTeardown also
-      # manage the stack (idempotent bring-up, teardown on success) — this
-      # step still needs the explicit bring-up above so a stack failure is
-      # isolated to that step's logs, and the always()-guarded teardown below
-      # so cleanup runs even if this step fails outright or the job is
-      # cancelled by the timeout above.
+      # jest.integration.config.js's own globalSetup brings the stack up
+      # (backend/tests/integration/globalSetup.js runs the identical
+      # `docker compose up -d --build mongo redis backend1 backend2`) — this
+      # step deliberately does NOT also bring it up first. Running that
+      # command twice — once here, then again in globalSetup against an
+      # already-running stack — let a rebuild-and-recreate race silently eat
+      # the rest of globalSetup's execution on a previous run (Compose
+      # re-tagged the image on the second build and recreated backend1/
+      # backend2 mid-waitForHealth), while the step still reported success.
+      # One authority for bring-up avoids that path entirely, and matches
+      # exactly what `npm run test:integration` does locally.
       - name: Run integration suite
         working-directory: backend
         run: npm run test:integration
