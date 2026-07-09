@@ -27,6 +27,22 @@ const apiLimiter = rateLimit({
   message: { error: "Too many requests — please slow down" },
 });
 
+// Found under load-test/: @socket.io/redis-adapter's fetchSockets() (used by
+// broadcastFilePresence() in roomService.js) has an internal race where its
+// timeout-cleanup can fire a rejection on an already-settled promise under
+// concurrent load — an ORPHANED rejection our own try/catch around
+// `await io.in(roomId).fetchSockets()` never sees, because it belongs to a
+// different promise than the one we're awaiting. Node kills the whole
+// process on an unhandled rejection by default (since v15), which took down
+// every connected user over one flaky presence broadcast. A single
+// misbehaving dependency call shouldn't be able to do that — log it and keep
+// the server up, the same way every other fallible operation in this
+// codebase degrades (see the try/catch pattern throughout roomService.js)
+// instead of crashing.
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled rejection (server stays up):", err instanceof Error ? err.message : err);
+});
+
 const app = express();
 const server = http.createServer(app);
 

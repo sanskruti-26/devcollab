@@ -1,0 +1,11 @@
+{
+  "name": "devcollab-load-test-fixtures",
+  "private": true,
+  "description": "One-time offline generator for the k6 load test's Yjs update fixtures — not part of the k6 runtime itself, see generate-yjs-fixtures.js.",
+  "scripts": {
+    "generate": "node generate-yjs-fixtures.js"
+  },
+  "devDependencies": {
+    "yjs": "^13.6.31"
+  }
+}
