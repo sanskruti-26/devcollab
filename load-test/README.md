@@ -133,8 +133,82 @@ has a race that rejects an already-settled promise, orphaned from our own
 shouldn't be able to take down every connected user. The numbers above are
 from the run *after* that fix; see the git history for the fix itself.
 
-Don't take these numbers as permanent baselines — re-run and update this
-section whenever you materially change `roomService.js`, the Redis
+### Tier 2: 500 editors — where it actually starts to strain
+
+500 editors (100 rooms × 5) + 50 reconnect-churn VUs (same 10% ratio), 120s,
+same command with `ROOMS=100 -e RECONNECT_VUS=50`:
+
+```
+sync_latency_ms.....: avg=17.15s  min=14ms    med=5.58s  max=1m30s  p(90)=1m2s   p(95)=1m7s
+reconnect_time_ms...: avg=50.47s  min=34.17s  med=49.04s max=1m36s  p(90)=50.71s p(95)=1m34s
+yjs_updates_sent....: 4119
+yjs_updates_received: 7992
+ws_connect_errors...: 520          (out of 612 total ws_sessions)
+ws_auth_errors......: 0
+ws_connecting.......: avg=22.7s   min=29ms    med=21.01s max=41.59s p(90)=39.92s p(95)=40.21s
+reconnect_cycles....: 22
+```
+
+This is a real breaking point, not a graceful degradation — `sync_latency_ms`
+p95 goes from 51**ms** at 100 editors to 67**seconds** at 500, and
+`ws_connect_errors` alone (520) exceeds the entire editor count from tier 1.
+`ws_connecting` (time to establish the WebSocket itself, before any app
+logic) averaging 22.7s tells you most of this is a connection-admission
+problem, not the sync/relay logic itself buckling.
+
+**Backend1/backend2 did NOT crash this time** — `docker compose ps` showed
+both still up throughout, confirming the `unhandledRejection` fix holds even
+under 5x more load than what killed them before. But the log tally shows
+exactly why the connection burst is so damaging:
+
+```
+broadcastFilePresence error: timeout reached while waiting for fetchSockets response   × 48
+Unhandled rejection (server stays up): timeout reached ...                              × 7
+```
+
+`broadcastFilePresence()` — which does a cross-instance `io.in(roomId).fetchSockets()`
+round trip via the Redis adapter — is called on **every** `join-room`,
+`active-file-change`, *and* `yjs-sync-request`. At 550 connections all
+joining/syncing within the same few-second burst, that's a large spike of
+expensive cross-instance calls competing for the same Redis pub/sub channel
+the adapter uses internally, and a meaningful fraction of them (48 logged,
+plus the 7 that would have crashed the process pre-fix) time out. Each
+timeout burns the adapter's default wait window doing nothing useful, adding
+to event-loop pressure — a plausible direct contributor to `ws_connecting`
+ballooning to 20-40s for everyone else trying to connect at the same time,
+not just the requests that themselves timed out.
+
+Also present but **not** a new scale-specific finding: `getOrCreateYDoc
+hydration error` fired once per synthetic `loadtest-file-N` /
+`loadtest-reconnect-file-N` (this test's fake, non-ObjectId file ids being
+rejected by `File.findById`), same as the pre-existing `reconcileComments
+error` / `File auto-save error` "Cast to ObjectId" noise seen at every scale
+in this test — all caught, all harmless, just proportionally more log lines
+at 5x the edit volume. Don't read these three as part of the strain finding.
+
+One script-level caveat: a handful of `sendYjsUpdate` calls threw
+`InvalidStateError` (trying to send on a socket that had already errored out
+from underneath a VU mid-flight) — a robustness gap in `script.js` under
+this much connection instability, not a masked app issue. It doesn't change
+the finding above, but means the true failure count could be marginally
+undercounted rather than overcounted.
+
+**Diagnosis, not yet a fix**: the natural next step is reducing how often
+`broadcastFilePresence()` actually needs to do a cross-instance fetch —
+right now it re-fetches on every `yjs-sync-request`, which is far more
+frequent than "who's viewing this room" actually changes. That's a real
+optimization opportunity this load test surfaced, not something fixed here.
+
+### What this means for the two tiers together
+
+Somewhere between 100 and 500 concurrent editors there's a knee point where
+`broadcastFilePresence`'s per-event `fetchSockets()` calls go from
+"occasionally slow" to "actively starving the connection path." Narrowing
+that down (e.g. try 200, 300) is the natural next investigation — see
+[Scaling up from here](#scaling-up-from-here).
+
+Don't take either tier's numbers as permanent baselines — re-run and update
+this section whenever you materially change `roomService.js`, the Redis
 integration, or the infra topology.
 
 ## Fixtures
@@ -165,13 +239,20 @@ Current baseline (100 editors / 10 reconnect VUs / 120s) ran clean with the
 latency, sub-500ms p95 reconnect time. Suggested progression, changing one
 axis at a time so a regression is attributable:
 
-1. **More rooms, same room size** — `ROOMS=50 USERS_PER_ROOM=5` (250
-   editors), then `ROOMS=100` (500), then `ROOMS=200` (1000 — the current
-   fixture pool's ceiling; bump `POOL_SIZE` in
-   `fixtures/generate-yjs-fixtures.js` and regenerate to go further). This
-   scales total connection count and total room count together — watch
-   `ws_connecting` and `sync_latency_ms` p95 for degradation, and watch
-   `docker stats` on `backend1`/`backend2`/`redis` for CPU/memory pressure.
+1. **More rooms, same room size** — already know the two endpoints: 100
+   editors (20 rooms) ran clean, 500 editors (100 rooms) broke badly (see
+   [Tier 2](#tier-2-500-editors--where-it-actually-starts-to-strain)). The
+   useful next step isn't going bigger, it's narrowing —
+   `ROOMS=40 USERS_PER_ROOM=5` (200 editors), then `ROOMS=60` (300), to find
+   the actual knee point between "clean" and "520 connect errors," and
+   whether `ws_connecting` degrades gradually or falls off a cliff at some
+   specific concurrency. Past that: `ROOMS=200` (1000 — the current fixture
+   pool's ceiling; bump `POOL_SIZE` in `fixtures/generate-yjs-fixtures.js`
+   and regenerate to go further). Watch `docker stats` on
+   `backend1`/`backend2`/`redis` for CPU/memory pressure, and grep backend
+   logs for `broadcastFilePresence error` / `Unhandled rejection` counts at
+   each tier — tier 2 showed those scaling with the strain, not just present
+   or absent.
 
 2. **Bigger rooms, same room count** — hold `ROOMS` steady, raise
    `USERS_PER_ROOM` to 10, then 20. This is a *different* stress axis: each
