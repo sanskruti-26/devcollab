@@ -1,0 +1,67 @@
+name: Integration Tests
+
+# Same fixture as `npm run test:integration` locally (see
+# backend/tests/integration/) — a real multi-instance docker-compose stack
+# (mongo, redis, two backend instances), not mocks. Runs the suite ONCE per
+# push/PR; the 10x repeated run used to hunt intermittent failures is a local
+# verification step (see backend/scripts/verify-multi-instance-race.js and
+# the jest.integration.config.js suite), too slow/expensive to repeat on
+# every CI run.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  integration:
+    name: Multi-instance integration suite
+    runs-on: ubuntu-latest
+    # A hung container (or a test that never resolves) shouldn't block CI
+    # indefinitely — this is a hard ceiling on the whole job, bring-up
+    # through teardown.
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      # Same command jest's globalSetup runs locally (see
+      # backend/tests/integration/globalSetup.js) — done as its own step here
+      # so a failure to bring the stack up shows as a distinct, obviously-infra
+      # CI failure rather than being buried inside a Jest error trace.
+      - name: Bring up multi-instance test stack (mongo, redis, backend1, backend2)
+        run: docker compose up -d --build mongo redis backend1 backend2
+
+      # jest.integration.config.js's own globalSetup/globalTeardown also
+      # manage the stack (idempotent bring-up, teardown on success) — this
+      # step still needs the explicit bring-up above so a stack failure is
+      # isolated to that step's logs, and the always()-guarded teardown below
+      # so cleanup runs even if this step fails outright or the job is
+      # cancelled by the timeout above.
+      - name: Run integration suite
+        working-directory: backend
+        run: npm run test:integration
+
+      # Ephemeral GitHub-hosted runners are destroyed after the job either
+      # way, so this doesn't protect anything beyond THIS run — but it makes
+      # a failing run's container output visible in the Actions log instead
+      # of lost with the VM.
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down test stack
+        if: always()
+        run: docker compose down -v

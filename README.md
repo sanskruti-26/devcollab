@@ -1,5 +1,7 @@
 # DevCollab
 
+[![Integration Tests](https://github.com/sanskruti-26/devcollab/actions/workflows/integration-tests.yml/badge.svg)](https://github.com/sanskruti-26/devcollab/actions/workflows/integration-tests.yml)
+
 **Live demo:** [https://devcollab-eta.vercel.app]
 
 > Render's free-tier backend sleeps after inactivity — the first request after a while can take ~30s to wake up. That's a free-tier limitation, not a bug.
