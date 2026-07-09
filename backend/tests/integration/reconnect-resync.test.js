@@ -53,7 +53,7 @@ describe("disconnect + reconnect resyncs from persisted state, no data loss", ()
     // ydocs Map is gone. The next sync-request can only be answered by
     // rehydrating from Redis or Mongo.
     restartService("backend1");
-    await waitForHealth(`${BACKEND1_URL}/health`);
+    await waitForHealth(`${BACKEND1_URL}/health`, "backend1 (post-restart, redis-snapshot test)");
 
     const reconnected = await connect(BACKEND1_URL, "redisResyncUser");
     await joinRoom(reconnected, roomId);
@@ -90,7 +90,7 @@ describe("disconnect + reconnect resyncs from persisted state, no data loss", ()
     redisDel(`yjs:state:${fileId}`);
 
     restartService("backend1");
-    await waitForHealth(`${BACKEND1_URL}/health`);
+    await waitForHealth(`${BACKEND1_URL}/health`, "backend1 (post-restart, mongo-fallback test)");
 
     const reconnected = await connect(BACKEND1_URL, "mongoFallbackUser");
     await joinRoom(reconnected, roomId);

@@ -40,19 +40,39 @@ function run(args, attempts = 3) {
   );
 }
 
-async function waitForHealth(url, timeoutMs = 60000) {
+// Polls `url` until it responds 2xx, or throws. Logs progress every ~5s (not
+// every 1s attempt — that would flood the log) specifically so a genuine
+// HANG is visibly distinguishable in CI from a fast, silent failure: if this
+// never prints even its first "polling..." line, the process died or
+// stalled before reaching this call at all, which is a different bug than a
+// slow-to-boot container.
+async function waitForHealth(url, label, timeoutMs = 60000) {
   const start = Date.now();
   let lastErr;
+  let attempt = 0;
+  console.log(`[waitForHealth] ${label}: polling ${url} (timeout ${timeoutMs}ms)...`);
   while (Date.now() - start < timeoutMs) {
+    attempt++;
     try {
       const res = await fetch(url);
-      if (res.ok) return;
+      if (res.ok) {
+        console.log(`[waitForHealth] ${label}: healthy after ${Date.now() - start}ms (attempt ${attempt}).`);
+        return;
+      }
+      lastErr = new Error(`HTTP ${res.status}`);
     } catch (err) {
       lastErr = err;
     }
+    const elapsed = Date.now() - start;
+    if (elapsed > 0 && elapsed % 5000 < 1000) {
+      console.log(`[waitForHealth] ${label}: still waiting after ${elapsed}ms (last error: ${lastErr?.message})...`);
+    }
     await new Promise((r) => setTimeout(r, 1000));
   }
-  throw new Error(`Timed out waiting for ${url} to become healthy: ${lastErr?.message}`);
+  throw new Error(
+    `[waitForHealth] ${label}: TIMED OUT after ${timeoutMs}ms waiting for ${url} to become healthy. ` +
+      `Last error: ${lastErr?.message ?? "(none — never got a response at all)"}`
+  );
 }
 
 // Restarts a single service container in place (same image, same port
