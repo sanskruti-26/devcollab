@@ -27,10 +27,13 @@ top of `script.js` for the exact framing). Real Yjs update bytes are used
 
 - Docker (the test runs via the official `grafana/k6` image — no local k6
   install needed)
-- The docker-compose stack, including nginx, running:
+- The docker-compose stack, including nginx, running. `-f docker-compose.yml`
+  is required now that the repo also has a `compose.yaml` (the plain
+  one-command full-app stack, see the root README) — Compose prefers
+  `compose.yaml` by default, so this rig has to be named explicitly:
   ```
   cd ..
-  docker compose up -d --build mongo redis backend1 backend2 nginx
+  docker compose -f docker-compose.yml up -d --build mongo redis backend1 backend2 nginx
   ```
 
 ## Running it
@@ -39,14 +42,14 @@ From `load-test/`, on Windows/Git-Bash, `MSYS_NO_PATHCONV=1` is required or
 Git Bash mangles the container-side paths in `-v` and the script path:
 
 ```bash
-MSYS_NO_PATHCONV=1 docker run --rm --network devcollab_default \
+MSYS_NO_PATHCONV=1 docker run --rm --network devcollab-loadtest_default \
   -v "$(pwd):/scripts" -w /scripts \
   grafana/k6 run \
   -e ROOMS=20 -e USERS_PER_ROOM=5 -e RECONNECT_VUS=10 -e DURATION_S=120 \
   script.js
 ```
 
-`--network devcollab_default` joins the test container to the compose
+`--network devcollab-loadtest_default` joins the test container to the compose
 network so it can resolve `nginx` by service name (the default
 `BASE_WS_URL`). Running k6 natively on the host instead: pass
 `-e BASE_WS_URL=ws://localhost:8080`.

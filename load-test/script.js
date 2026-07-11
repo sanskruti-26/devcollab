@@ -49,7 +49,7 @@ import { SharedArray } from "k6/data";
 // README.md for why (round-robin across backend1/backend2, the actual
 // multi-instance scenario this is meant to exercise). Override with
 // -e BASE_WS_URL=ws://localhost:8080 if running k6 natively on the host
-// instead of via `docker run --network devcollab_default`.
+// instead of via `docker run --network devcollab-loadtest_default`.
 const BASE_WS_URL = __ENV.BASE_WS_URL || "ws://nginx:80";
 // Matches the dev-only secret in docker-compose.yml — never reuse this value
 // for anything real.

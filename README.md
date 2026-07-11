@@ -10,6 +10,28 @@ DevCollab is a real-time collaborative code editor — Google Docs, but for code
 
 ---
 
+## Quick Start (Docker)
+
+One command runs the whole app — frontend, backend, MongoDB, and Redis. No local Node.js or MongoDB install needed, just Docker.
+
+```bash
+git clone https://github.com/sanskruti-26/devcollab.git
+cd devcollab
+cp .env.example .env
+docker compose up --build
+```
+
+Then open **http://localhost:5173**, register an account, create a room, and open the room URL in a second tab (or incognito window) to see live sync in action.
+
+- `.env.example` already has a usable (dev-only, not secret) `JWT_SECRET` — no edits required to just try the app.
+- `JUDGE0_KEY` (Run Code) and `GEMINI_API_KEY` (AI pair programmer) are optional — leave them blank in `.env` and those two features return a friendly "not configured" message instead of erroring. See `.env.example` for where to get free keys.
+- `docker compose down` stops everything; add `-v` too if you also want to wipe the MongoDB volume.
+- You'll see a one-line `Using compose.yaml` notice from Docker — that's expected, not an error (see [Local Setup](#local-setup) below for why there are two compose files in this repo).
+
+This runs a single backend instance — good for trying the app or day-to-day local dev. For a from-source setup instead (e.g. to point at MongoDB Atlas, or run the frontend/backend directly with `npm run dev`), see [Local Setup](#local-setup) below. There's also a separate multi-instance Docker stack (two backend containers behind nginx) used for load testing and verifying multi-instance sync — see [`load-test/README.md`](load-test/README.md).
+
+---
+
 ## Architecture
 
 ```
@@ -118,6 +140,8 @@ DevCollab is a real-time collaborative code editor — Google Docs, but for code
 
 ## Local Setup
 
+Just want to run the app? See [Quick Start](#quick-start-docker) above — this section is the from-source setup (e.g. to use MongoDB Atlas instead of a local container, or to run frontend/backend directly with `npm run dev` instead of Docker).
+
 ### Prerequisites
 - Node.js 18+
 - A free [MongoDB Atlas](https://www.mongodb.com/atlas) cluster
@@ -174,6 +198,18 @@ Both servers must run simultaneously. Open `http://localhost:5173`, register an 
 |---|---|---|
 | `VITE_API_URL` | **Yes** | Base URL of the backend REST API (e.g. `http://localhost:5000`) |
 | `VITE_SOCKET_URL` | **Yes** | Base URL the Socket.io client connects to (usually same as `VITE_API_URL`) |
+
+### Docker Compose (`.env` at repo root)
+
+Only used by [Quick Start](#quick-start-docker)'s `compose.yaml` — separate from `backend/.env` / `frontend/.env` above, which are for running outside Docker.
+
+| Variable | Required | Description |
+|---|---|---|
+| `JWT_SECRET` | **Yes** | Same as backend's — `.env.example` ships a usable dev placeholder |
+| `JUDGE0_KEY` | No | Same as backend's — code execution returns a 503 until set |
+| `GEMINI_API_KEY` | No | Same as backend's — AI pair programmer returns a 503 until set |
+| `MONGODB_URI` | No (default: bundled `mongo` container) | Override to point at MongoDB Atlas instead |
+| `REDIS_URL` | No (default: bundled `redis` container) | Only load-bearing with more than one backend instance; included for parity with the deploy topology |
 
 ---
 

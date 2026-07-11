@@ -6,7 +6,13 @@
 # Redis so Socket.io broadcasts reach sockets connected to the *other*
 # instance (see attachRedisAdapter() in backend/src/server.js).
 #
-# Usage: docker compose up --build
+# Just want to run the app? See compose.yaml (repo root) instead — one backend
+# instance, no nginx, `docker compose up` with no flags. Because compose.yaml
+# exists, plain `docker compose up` in this directory now runs THAT file, not
+# this one — Compose prefers compose.yaml when both are present. Run this rig
+# explicitly:
+#
+# Usage: docker compose -f docker-compose.yml up --build
 #   frontend  → http://localhost:5173
 #   nginx     → http://localhost:8080 (what the frontend actually talks to)
 #   backend1  → http://localhost:5001 (direct, for debugging which instance did what)
@@ -15,6 +21,12 @@
 # To specifically check the Redis pub/sub fix for concurrent cross-instance
 # edits (see services/roomService.js), once mongo/redis/backend1/backend2 are
 # up: `cd backend && npm run verify:multi-instance`
+
+# Explicit project name (not left to default to the directory name) so this
+# stack's containers/network never collide with compose.yaml's, even if both
+# happen to be run from this same directory at some point. This changes the
+# compose network name to devcollab-loadtest_default — see load-test/README.md.
+name: devcollab-loadtest
 
 services:
   mongo:
