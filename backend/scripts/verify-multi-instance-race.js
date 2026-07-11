@@ -16,34 +16,87 @@
 //   npm run verify:multi-instance
 //
 // Env overrides (defaults match docker-compose.yml):
-//   BACKEND1_URL, BACKEND2_URL, JWT_SECRET
+//   BACKEND1_URL, BACKEND2_URL
 
-const jwt = require("jsonwebtoken");
 const { io } = require("socket.io-client");
 const Y = require("yjs");
 
 const BACKEND1_URL = process.env.BACKEND1_URL || "http://localhost:5001";
 const BACKEND2_URL = process.env.BACKEND2_URL || "http://localhost:5002";
-// Matches the dev-only secret in docker-compose.yml — never reuse this value
-// for anything real.
-const JWT_SECRET = process.env.JWT_SECRET || "devcollab_docker_compose_dev_secret_do_not_use_in_prod";
 
-const roomId = `race-test-room-${Date.now()}`;
-const fileId = `race-test-file-${Date.now()}`;
-
-function mintToken(name) {
-  return jwt.sign({ id: name, name, email: `${name}@test.local` }, JWT_SECRET);
+// join-room does a real DB-backed owner-or-participant check (see
+// authorizeRoomJoin in roomService.js) — a hand-minted JWT for a made-up
+// roomId that was never actually created via the REST API fails it every
+// time. This registers two real users and a real room/file through the
+// same REST routes the frontend uses, so both sockets carry genuine access:
+// userA creates the room (becomes owner), userB does the same GET /:roomId
+// the frontend does on join, which adds them as a participant.
+async function registerUser(name) {
+  const email = `${name}-${Date.now()}@test.local`;
+  const res = await fetch(`${BACKEND1_URL}/api/v1/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, email, password: "racetest123" }),
+  }).then((r) => r.json());
+  if (!res.token) throw new Error(`registerUser(${name}) failed: ${JSON.stringify(res)}`);
+  return res.token;
 }
 
-function connect(url, name) {
+async function setupRoomAndFile() {
+  const tokenA = await registerUser("userA");
+  const tokenB = await registerUser("userB");
+
+  const room = await fetch(`${BACKEND1_URL}/api/v1/rooms`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${tokenA}` },
+    body: JSON.stringify({ name: `race-test-room-${Date.now()}`, language: "javascript" }),
+  }).then((r) => r.json());
+  if (!room.roomId) throw new Error(`Room creation failed: ${JSON.stringify(room)}`);
+
+  // Same GET the frontend fires on join — adds userB to room.participants.
+  await fetch(`${BACKEND1_URL}/api/v1/rooms/${room.roomId}`, {
+    headers: { Authorization: `Bearer ${tokenB}` },
+  }).then((r) => r.json());
+
+  const files = await fetch(`${BACKEND1_URL}/api/v1/rooms/${room.roomId}/files`, {
+    headers: { Authorization: `Bearer ${tokenA}` },
+  }).then((r) => r.json());
+  if (!files[0]?._id) throw new Error(`File lookup failed: ${JSON.stringify(files)}`);
+
+  return { tokenA, tokenB, roomId: room.roomId, fileId: files[0]._id };
+}
+
+function connect(url, token) {
   return new Promise((resolve, reject) => {
-    const socket = io(url, { auth: { token: mintToken(name) }, transports: ["websocket"] });
+    const socket = io(url, { auth: { token }, transports: ["websocket"] });
     socket.once("connect", () => resolve(socket));
     socket.once("connect_error", (err) => reject(new Error(`${url} connect_error: ${err.message}`)));
   });
 }
 
-function syncRequest(socket) {
+// Mirrors the real frontend's roomJoinedRef gating (see RoomPage.jsx): wait
+// for the server's explicit "room-joined" ack — sent only after join-room's
+// DB-backed authorization check resolves — instead of a fixed sleep guessing
+// how long that check takes. A fixed delay was a symptom of the same race
+// class that used to cause the empty-editor-on-refresh bug: yjs-sync-request
+// arriving before join-room's authorization landed got silently dropped by
+// requireRoomAccess. Waiting on the real ack is exact instead of hopeful.
+function joinRoom(socket, roomId) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("room-joined ack timeout")), 5000);
+    socket.once("room-joined", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    socket.once("room-access-denied", (payload) => {
+      clearTimeout(timer);
+      reject(new Error(`room-access-denied: ${JSON.stringify(payload)}`));
+    });
+    socket.emit("join-room", { roomId });
+  });
+}
+
+function syncRequest(socket, roomId, fileId) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("yjs-sync-response timeout")), 5000);
     socket.once("yjs-sync-response", ({ state }) => {
@@ -61,16 +114,17 @@ function decodeText(state) {
 }
 
 async function main() {
-  const socket1 = await connect(BACKEND1_URL, "userA");
-  const socket2 = await connect(BACKEND2_URL, "userB");
+  const { tokenA, tokenB, roomId, fileId } = await setupRoomAndFile();
+  console.log(`Created room ${roomId} (file ${fileId}) via REST — userA owns it, userB is a participant`);
+
+  const socket1 = await connect(BACKEND1_URL, tokenA);
+  const socket2 = await connect(BACKEND2_URL, tokenB);
   console.log(`Connected: ${BACKEND1_URL} (${socket1.id}) and ${BACKEND2_URL} (${socket2.id})`);
 
-  socket1.emit("join-room", { roomId });
-  socket2.emit("join-room", { roomId });
-  await new Promise((r) => setTimeout(r, 300));
+  await Promise.all([joinRoom(socket1, roomId), joinRoom(socket2, roomId)]);
 
   // Both clients start from the same (empty) doc state.
-  const initialState = await syncRequest(socket1);
+  const initialState = await syncRequest(socket1, roomId, fileId);
   const doc1 = new Y.Doc();
   Y.applyUpdate(doc1, new Uint8Array(initialState));
   const doc2 = new Y.Doc();
@@ -92,8 +146,8 @@ async function main() {
 
   await new Promise((r) => setTimeout(r, 1500)); // let Redis pub/sub propagate
 
-  const final1 = await syncRequest(socket1);
-  const final2 = await syncRequest(socket2);
+  const final1 = await syncRequest(socket1, roomId, fileId);
+  const final2 = await syncRequest(socket2, roomId, fileId);
   const text1 = decodeText(final1);
   const text2 = decodeText(final2);
 
