@@ -202,13 +202,56 @@ right now it re-fetches on every `yjs-sync-request`, which is far more
 frequent than "who's viewing this room" actually changes. That's a real
 optimization opportunity this load test surfaced, not something fixed here.
 
+### Tier 2 re-run after throttling `broadcastFilePresence()` (2026-07-10)
+
+Fix: `broadcastFilePresence()` in `roomService.js` is now throttled per room
+(leading + trailing, 300ms window) instead of calling `fetchSockets()` on
+every single `join-room` / `active-file-change` / `yjs-sync-request`. Bursts
+of those events for the same room now coalesce into at most one
+`fetchSockets()` call per 300ms, with a trailing call guaranteeing the final
+state still gets broadcast. Same command, same tier (`ROOMS=100
+RECONNECT_VUS=50`, 500 editors, 120s):
+
+```
+sync_latency_ms.....: avg=15.35s min=13ms     med=7s     max=1m21s p(90)=45.68s p(95)=54.13s
+reconnect_time_ms...: avg=33.88s min=8.16s    med=36.49s max=1m11s p(90)=45.53s p(95)=57.88s
+yjs_updates_sent....: 4257
+yjs_updates_received: 8237
+ws_connect_errors...: 361          (out of 623 total ws_sessions)
+ws_auth_errors......: 0
+ws_connecting.......: avg=31.8s   min=146.11ms med=29.81s max=57.14s p(90)=51.16s p(95)=53.09s
+reconnect_cycles....: 55
+```
+
+Backend log tally for the same run: `broadcastFilePresence error` (fetchSockets
+timeout) dropped from 48 to 28, and `Unhandled rejection` went from 7 to 17.
+Both `backend1`/`backend2` stayed up throughout, same as the pre-fix tier 2 run.
+
+**This is a real, measurable improvement, not a full fix.** `sync_latency_ms`
+p95 improved from 67s to 54.13s (~19%) and `reconnect_time_ms` p95 from 94s to
+57.88s (~38%), tracking the ~42% drop in logged `fetchSockets` timeouts —
+consistent with the throttle doing exactly what it targets. But
+`ws_connect_errors` (361) still crosses the `count==0` threshold, and
+`ws_connecting` — raw WebSocket handshake time, before any app logic runs —
+got *worse* on average (31.8s vs 22.7s), not better. That matches what this
+section already suspected: the dominant failure mode at 500 concurrent editors
+is connection-admission capacity under a simultaneous connection burst
+(nginx/backend accept queue), not `broadcastFilePresence` alone. Throttling it
+relieves one real contributor to event-loop pressure but doesn't touch that
+root cause. Treat `reconnect_cycles` (55 here vs 22 pre-fix) as a reminder the
+two runs aren't perfectly comparable samples, and re-baseline on real
+infrastructure before trusting absolute numbers from this laptop.
+
 ### What this means for the two tiers together
 
 Somewhere between 100 and 500 concurrent editors there's a knee point where
 `broadcastFilePresence`'s per-event `fetchSockets()` calls go from
 "occasionally slow" to "actively starving the connection path." Narrowing
 that down (e.g. try 200, 300) is the natural next investigation — see
-[Scaling up from here](#scaling-up-from-here).
+[Scaling up from here](#scaling-up-from-here). The presence throttle above
+measurably reduces one contributor to that strain, but the connection-admission
+bottleneck it exposed still needs its own investigation (nginx/backend accept
+queue capacity), independent of anything in `roomService.js`.
 
 Don't take either tier's numbers as permanent baselines — re-run and update
 this section whenever you materially change `roomService.js`, the Redis
