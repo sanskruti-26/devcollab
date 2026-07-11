@@ -162,6 +162,15 @@ export default function RoomPage() {
   const activeFileIdRef = useRef(null);
   const filesRef        = useRef([]);
 
+  // True only once the server has ack'd join-room for the CURRENT socket
+  // connection (see the "room-joined" handler in connectSocket). Reset on
+  // every fresh "connect" (including reconnects — join-room's authorization
+  // is per-socket server-side, so it must be re-earned after every drop).
+  // Gates any room-scoped emit that fires automatically (not from a user
+  // click) — currently just yjs-sync-request — so it can never again race
+  // ahead of join-room's DB-backed authorization and get silently dropped.
+  const roomJoinedRef = useRef(false);
+
   useEffect(() => { activeFileIdRef.current = activeFile?._id || null; }, [activeFile]);
   useEffect(() => { filesRef.current = files; },                        [files]);
   useEffect(() => { commentsRef.current = comments; },                  [comments]);
@@ -360,16 +369,51 @@ export default function RoomPage() {
     socketSetup.current = true;
 
     socket.on("connect", () => {
+      // A fresh connection (first connect OR a reconnect after a drop) has
+      // no authorization on the server yet — join-room has to run again
+      // before any room-scoped request is safe to send. See roomJoinedRef.
+      roomJoinedRef.current = false;
       // No userName in the payload — the server derives identity from the
       // verified JWT sent during the handshake (socket.user), not from
       // whatever a client claims here.
       socket.emit("join-room", { roomId });
-      // Only re-request Yjs state on RECONNECTION — when ydocRef is already
-      // set (editor was mounted before the drop). On initial connect ydocRef
-      // is null; handleEditorMount fires shortly after and requests sync then.
+      // yjs-sync-request is NOT emitted here anymore — see the "room-joined"
+      // handler below, which is the single place that fires it (covering
+      // both "Monaco already mounted, reconnect just happened" and "Monaco
+      // hasn't mounted yet" via handleEditorMount's own check).
+    });
+
+    // Explicit ack that THIS connection is now authorized for this room —
+    // the server only sends this after its DB-backed join-room check
+    // resolves. Waiting for it (instead of firing yjs-sync-request right
+    // after "connect") is what closes the race that used to cause the
+    // empty-editor-on-refresh bug: previously, a fast Monaco mount could
+    // fire yjs-sync-request before that DB check finished, and the server
+    // silently dropped it with no response ever coming back.
+    socket.on("room-joined", () => {
+      roomJoinedRef.current = true;
+      // If Monaco already mounted (editor was up before a reconnect, or
+      // beat this ack to the punch), fire the sync request now — it was
+      // deliberately skipped until this point. If Monaco hasn't mounted
+      // yet, handleEditorMount will see roomJoinedRef.current === true and
+      // fire it itself once it runs.
       if (activeFileIdRef.current && ydocRef.current) {
         socket.emit("yjs-sync-request", { roomId, fileId: activeFileIdRef.current });
       }
+    });
+
+    // Explicit, loud, client-visible signals for the two ways a room-scoped
+    // request can be rejected server-side — join-room itself (no access to
+    // the room at all) and everything else gated by requireRoomAccess (sent
+    // before this socket's join-room has been authorized, or a stale roomId).
+    // Neither used to reach the user in any form; both now surface as a
+    // toast instead of silently hanging.
+    socket.on("room-access-denied", ({ roomId: deniedRoomId }) => {
+      addToast(`Access denied for room ${deniedRoomId}`);
+    });
+    socket.on("room-access-error", ({ event, roomId: errRoomId, reason }) => {
+      console.error(`[room-access-error] ${event} rejected for room ${errRoomId}: ${reason}`);
+      addToast(`Action "${event}" was rejected — please refresh if this repeats`);
     });
 
     // Handshake-level auth failure (missing/expired token) — mirrors the axios
@@ -606,12 +650,19 @@ export default function RoomPage() {
       });
     });
 
-    // Request the full current state for this file from the server.
-    // yjs-sync-response will apply it, populating the editor via the binding.
-    socket.emit("yjs-sync-request", {
-      roomId,
-      fileId: activeFileIdRef.current,
-    });
+    // Request the full current state for this file from the server —
+    // but only once join-room has actually been ack'd for this connection.
+    // If it hasn't yet (this mount beat the "room-joined" ack — the exact
+    // race that used to cause the empty-editor-on-refresh bug), don't emit
+    // yet: the "room-joined" handler above will fire this same request once
+    // the ack arrives, since ydocRef.current is now set. yjs-sync-response
+    // will apply it whenever it lands, populating the editor via the binding.
+    if (roomJoinedRef.current) {
+      socket.emit("yjs-sync-request", {
+        roomId,
+        fileId: activeFileIdRef.current,
+      });
+    }
 
     // Cursor broadcasting — unchanged from original, plus a local flag the AI
     // panel reads to know whether to use the selection or the whole file as context.
@@ -884,7 +935,12 @@ export default function RoomPage() {
     socket.emit("run-start", { roomId });
 
     async function attempt() {
-      const { data } = await api.post("/api/v1/rooms/execute", { code, language });
+      // Room-scoped now (see backend/src/routes/rooms.js) — the server
+      // verifies membership itself and broadcasts "run-result" to everyone
+      // in the room once a real Judge0 call completes. We no longer emit
+      // run-result ourselves; the socket listener below (registered near the
+      // top of this component) is what updates everyone's UI, including ours.
+      const { data } = await api.post(`/api/v1/rooms/${roomId}/execute`, { code, language });
       return data.output || "(no output)";
     }
 
@@ -905,7 +961,6 @@ export default function RoomPage() {
       }
       setRunningBy(null);
       setRunOutput({ output, by: name });
-      socket.emit("run-result", { roomId, output });
     } catch (err) {
       const status    = err.response?.status;
       const serverMsg = err.response?.data?.error || "";
@@ -919,7 +974,6 @@ export default function RoomPage() {
       }
       setRunningBy(null);
       setRunOutput({ output, by: name });
-      socket.emit("run-result", { roomId, output });
     }
   }
 

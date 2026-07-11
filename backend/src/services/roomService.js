@@ -52,6 +52,7 @@ const Message  = require("../models/Message");
 const Snapshot = require("../models/Snapshot");
 const Comment  = require("../models/Comment");
 const socketAuthMiddleware = require("../middleware/socketAuth");
+const { yjsUpdatesTotal } = require("../metrics");
 
 // Redis is optional here, same convention as attachRedisAdapter() in
 // server.js: only connects when REDIS_URL is set (multi-instance deployments,
@@ -218,6 +219,11 @@ const snapshotTimers = new Map();
 // Debounce timers for comment-anchor reconciliation — keyed by fileId.
 const commentReconcileTimers = new Map();
 
+// Throttle state for broadcastFilePresence, keyed by roomId — see that
+// function for how it's used.
+const presenceThrottle = new Map();
+const PRESENCE_THROTTLE_MS = 300;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // Returns the server-side Y.Doc for a file, LOCAL to this instance.
@@ -287,7 +293,43 @@ async function getOrCreateYDoc(fileId) {
 
 // Emit the current file-presence state to everyone in a room so they can show
 // "who is viewing which file" indicators in the sidebar.
-async function broadcastFilePresence(io, roomId) {
+//
+// Throttled per room, leading + trailing (like lodash's throttle): join-room,
+// active-file-change, and yjs-sync-request all call this, and under a
+// connection burst many of those fire within milliseconds of each other for
+// the same room — each call doing its own cross-instance fetchSockets() is
+// what drove fetchSockets timeouts at 500 concurrent editors (see
+// load-test/README.md, tier 2). A lone call in an otherwise-quiet room still
+// fires immediately (leading edge), so a single join still updates everyone
+// right away. Calls that land inside the PRESENCE_THROTTLE_MS window don't
+// trigger their own fetchSockets — they just set a flag so exactly one more
+// broadcast fires right after the window closes (trailing edge), capturing
+// whatever the latest state was by then. Net effect: at most one
+// fetchSockets() per room per window, no matter how many of the three events
+// fired inside it.
+function broadcastFilePresence(io, roomId) {
+  const state = presenceThrottle.get(roomId);
+
+  if (!state) {
+    presenceThrottle.set(roomId, { timer: schedulePresenceCooldown(io, roomId), callPending: false });
+    return runPresenceBroadcast(io, roomId);
+  }
+
+  state.callPending = true;
+  return Promise.resolve();
+}
+
+function schedulePresenceCooldown(io, roomId) {
+  return setTimeout(() => {
+    const state = presenceThrottle.get(roomId);
+    presenceThrottle.delete(roomId);
+    if (state && state.callPending) {
+      broadcastFilePresence(io, roomId); // trailing call: re-opens a fresh window
+    }
+  }, PRESENCE_THROTTLE_MS);
+}
+
+async function runPresenceBroadcast(io, roomId) {
   try {
     const sockets = await io.in(roomId).fetchSockets();
     const presence = sockets.map((s) => ({
@@ -444,6 +486,55 @@ function scheduleCommentReconcile(io, roomId, fileId) {
   );
 }
 
+// ── Room-membership authorization ─────────────────────────────────────────────
+// Mirrors hasRoomAccess() in routes/rooms.js — duplicated rather than imported
+// to avoid a circular require (routes/rooms.js already imports
+// broadcastCommentEvent from this file).
+function hasRoomAccess(room, userId) {
+  return (
+    room.owner.toString() === userId ||
+    room.participants.some((p) => p.toString() === userId)
+  );
+}
+
+// One DB round trip, made once at join-room time. Password-protected rooms
+// are covered implicitly: the only way to become a `participant` is the REST
+// flow verifying the password first (routes/rooms.js's GET /:roomId), so
+// "already a participant" already means "password already checked" — no
+// need to re-verify bcrypt here.
+async function authorizeRoomJoin(socket, roomId) {
+  if (!roomId) return false;
+  const room = await Room.findOne({ roomId });
+  if (!room) return false;
+  return hasRoomAccess(room, socket.user.id);
+}
+
+// Cheap, in-memory re-check used by every other room-scoped handler below —
+// no DB access, just "did this socket already pass the join-room check for
+// this exact roomId." A per-event DB hit here would reintroduce the same
+// kind of cost that made fetchSockets() buckle at scale (see
+// load-test/README.md) — yjs-update/cursor-move fire far too often for that.
+// Rejects the offending event rather than disconnecting the whole socket —
+// a stale/racy roomId on one bad event shouldn't kill an otherwise-valid
+// connection that may be correctly joined to a different room.
+//
+// This used to fail completely silently: a client-invisible no-op, with only
+// a console.warn on the server. That's how the empty-editor-on-refresh bug
+// stayed invisible — yjs-sync-request arriving before join-room's DB check
+// resolved was rejected here with nothing telling the client it happened.
+// The real fix is the client no longer racing this check (it now waits for
+// the "room-joined" ack below before firing sync requests), but this stays
+// as a loud, client-visible backstop for any handler/event that still hits
+// it — including ones added later that forget to wait for that ack.
+function requireRoomAccess(socket, roomId, eventName) {
+  if (roomId && socket.authorizedRooms.has(roomId)) return true;
+  console.error(
+    `[room-access] REJECTED "${eventName}" from ${socket.id} (user ${socket.user?.id}): no verified access to room ${roomId}`
+  );
+  socket.emit("room-access-error", { event: eventName, roomId, reason: "not-authorized" });
+  return false;
+}
+
 // ── Socket handlers ───────────────────────────────────────────────────────────
 
 function setupSocketHandlers(io) {
@@ -455,14 +546,40 @@ function setupSocketHandlers(io) {
   io.on("connection", (socket) => {
     console.log(`Socket connected: ${socket.id} (user ${socket.user.id})`);
 
+    // Rooms this socket has been verified against (owner or participant),
+    // populated only by a successful join-room below.
+    socket.authorizedRooms = new Set();
+
     // ── join-room ─────────────────────────────────────────────────────────────
     // Identity comes from the verified JWT (socket.user), not the client
     // payload — a client can no longer claim to be someone else by passing a
     // different userName.
+    //
+    // Previously this joined whatever roomId the client sent with no check
+    // at all, silently bypassing the REST layer's password gate — any
+    // authenticated user could join any room's real-time channel, password-
+    // protected or not. Now it requires owner-or-participant, same as
+    // hasRoomAccess() in routes/rooms.js.
     socket.on("join-room", async ({ roomId }) => {
+      const authorized = await authorizeRoomJoin(socket, roomId);
+      if (!authorized) {
+        console.warn(`Rejected join-room: user ${socket.user.id} has no access to room ${roomId}`);
+        socket.emit("room-access-denied", { roomId });
+        return;
+      }
+
+      socket.authorizedRooms.add(roomId);
       socket.join(roomId);
       socket.roomId   = roomId;
       socket.userName = socket.user.name;
+
+      // Explicit ack that THIS socket is now authorized for THIS room — the
+      // client waits for this before firing any room-scoped request that
+      // isn't triggered by a user action (yjs-sync-request on mount, above
+      // all), instead of racing it against this handler's DB-backed check
+      // above. See requireRoomAccess's comment for what used to happen when
+      // that race was lost.
+      socket.emit("room-joined", { roomId });
 
       console.log(`${socket.userName} joined room ${roomId}`);
 
@@ -493,6 +610,7 @@ function setupSocketHandlers(io) {
 
     // ── active-file-change ────────────────────────────────────────────────────
     socket.on("active-file-change", async ({ roomId, fileId }) => {
+      if (!requireRoomAccess(socket, roomId, "active-file-change")) return;
       socket.activeFileId = fileId;
       await broadcastFilePresence(io, roomId);
     });
@@ -501,6 +619,7 @@ function setupSocketHandlers(io) {
     // Client asks for the full Y.Doc state on mount / file switch.
     // We send the raw Uint8Array so Socket.io uses binary framing, not JSON.
     socket.on("yjs-sync-request", async ({ roomId, fileId }) => {
+      if (!requireRoomAccess(socket, roomId, "yjs-sync-request")) return;
       socket.activeFileId = fileId;
 
       try {
@@ -523,6 +642,7 @@ function setupSocketHandlers(io) {
     // local Y.Doc for this file (via Redis pub/sub), then schedule a DB save
     // and a full-content snapshot.
     socket.on("yjs-update", async ({ roomId, fileId, update }) => {
+      if (!requireRoomAccess(socket, roomId, "yjs-update")) return;
       if (!fileId || !update) return;
 
       try {
@@ -532,6 +652,7 @@ function setupSocketHandlers(io) {
         // Origin 'server' is set so the doc's own update listener (if any) won't
         // re-broadcast. We don't have one here, but this follows the convention.
         Y.applyUpdate(ydoc, update, "server");
+        yjsUpdatesTotal.inc();
 
         // Relay the raw Buffer to every OTHER socket in the room.
         // Socket.io re-wraps it as binary for the receiving browsers.
@@ -559,6 +680,7 @@ function setupSocketHandlers(io) {
 
     // ── language-change ───────────────────────────────────────────────────────
     socket.on("language-change", ({ roomId, language, fileId }) => {
+      if (!requireRoomAccess(socket, roomId, "language-change")) return;
       socket.to(roomId).emit("language-update", { language, fileId: fileId || null });
       if (fileId) {
         File.findByIdAndUpdate(fileId, { language }).catch((err) =>
@@ -570,14 +692,17 @@ function setupSocketHandlers(io) {
     // ── File CRUD announcements ───────────────────────────────────────────────
 
     socket.on("announce-file-created", ({ roomId, file }) => {
+      if (!requireRoomAccess(socket, roomId, "announce-file-created")) return;
       socket.to(roomId).emit("file-created", { file });
     });
 
     socket.on("announce-file-renamed", ({ roomId, fileId, name, language }) => {
+      if (!requireRoomAccess(socket, roomId, "announce-file-renamed")) return;
       socket.to(roomId).emit("file-renamed", { fileId, name, language });
     });
 
     socket.on("announce-file-deleted", ({ roomId, fileId }) => {
+      if (!requireRoomAccess(socket, roomId, "announce-file-deleted")) return;
       // Clean up Y.Doc and all in-memory state for this file, on this instance...
       if (ydocs.has(fileId)) {
         ydocs.get(fileId).destroy();
@@ -618,6 +743,7 @@ function setupSocketHandlers(io) {
     // ── Chat ──────────────────────────────────────────────────────────────────
 
     socket.on("load-messages", async ({ roomId }) => {
+      if (!requireRoomAccess(socket, roomId, "load-messages")) return;
       try {
         const messages = await Message.find({ roomId })
           .sort({ createdAt: 1 })
@@ -629,6 +755,7 @@ function setupSocketHandlers(io) {
     });
 
     socket.on("send-message", async ({ roomId, text }) => {
+      if (!requireRoomAccess(socket, roomId, "send-message")) return;
       if (!text?.trim()) return;
       try {
         const msg = await Message.create({
@@ -649,6 +776,7 @@ function setupSocketHandlers(io) {
 
     // ── Cursors ───────────────────────────────────────────────────────────────
     socket.on("cursor-move", ({ roomId, position, selection, fileId }) => {
+      if (!requireRoomAccess(socket, roomId, "cursor-move")) return;
       socket.to(roomId).emit("cursor-update", {
         socketId:  socket.id,
         userName:  socket.userName,
@@ -661,22 +789,30 @@ function setupSocketHandlers(io) {
     // ── Code execution ────────────────────────────────────────────────────────
     // runnerName comes from socket.userName (verified at join), not the client
     // payload — otherwise any client could claim someone else ran the code.
+    //
+    // run-result is intentionally NOT handled here anymore — it used to be a
+    // plain client socket.emit with an arbitrary `output` string, completely
+    // disconnected from whether a real Judge0 call ever happened (a client
+    // could broadcast fake "output" to the whole room without ever running
+    // anything). It's now only ever emitted server-side, from inside the
+    // POST /:roomId/execute REST handler (routes/rooms.js), right after a
+    // real Judge0 result comes back. A client emitting "run-result" today
+    // just hits no listener — a no-op.
 
     socket.on("run-start", ({ roomId }) => {
+      if (!requireRoomAccess(socket, roomId, "run-start")) return;
       io.to(roomId).emit("run-start", { runnerName: socket.userName });
-    });
-
-    socket.on("run-result", ({ roomId, output }) => {
-      io.to(roomId).emit("run-result", { output, runnerName: socket.userName });
     });
 
     // ── Typing indicators ─────────────────────────────────────────────────────
 
     socket.on("typing-start", ({ roomId }) => {
+      if (!requireRoomAccess(socket, roomId, "typing-start")) return;
       socket.to(roomId).emit("user-typing", { userName: socket.userName });
     });
 
     socket.on("typing-stop", ({ roomId }) => {
+      if (!requireRoomAccess(socket, roomId, "typing-stop")) return;
       socket.to(roomId).emit("user-stopped-typing", { userName: socket.userName });
     });
 
