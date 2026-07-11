@@ -15,6 +15,7 @@ const authRoutes = require("./routes/auth");
 const roomRoutes = require("./routes/rooms");
 const aiRoutes   = require("./routes/ai");
 const { setupSocketHandlers } = require("./services/roomService");
+const metrics = require("./metrics");
 
 // General API: 200 requests per minute per IP — generous for real-time collab
 // but blocks bots hammering the rooms/files/execute endpoints.
@@ -61,6 +62,7 @@ const io = new Server(server, {
 // over the room's socket channel after a DB write, without importing socket.io
 // logic into the routes themselves.
 app.set("io", io);
+metrics.setIo(io);
 
 // Trust the first proxy hop so req.ip contains the real client IP behind Render's
 // load balancer. Without this, express-rate-limit v8 detects X-Forwarded-For and
@@ -79,6 +81,12 @@ app.use("/api/v1/ai",    aiRoutes);   // AI limiter is applied per-route inside 
 
 // Health check
 app.get("/health", (req, res) => res.json({ status: "ok" }));
+
+// Prometheus scrape target — unauthenticated, same as /health above.
+app.get("/metrics", async (req, res) => {
+  res.set("Content-Type", metrics.register.contentType);
+  res.end(await metrics.register.metrics());
+});
 
 // Socket.io real-time handlers
 setupSocketHandlers(io);

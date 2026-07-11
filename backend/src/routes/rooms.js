@@ -7,6 +7,7 @@ const File = require("../models/File");
 const Snapshot = require("../models/Snapshot");
 const Comment = require("../models/Comment");
 const { broadcastCommentEvent } = require("../services/roomService");
+const { judge0ExecutionsTotal } = require("../metrics");
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -351,6 +352,7 @@ router.post("/:roomId/execute", auth, async (req, res) => {
   }
 
   try {
+    judge0ExecutionsTotal.inc();
     const response = await fetch(
       "https://judge0-ce.p.rapidapi.com/submissions?base64_encoded=false&wait=true",
       {
