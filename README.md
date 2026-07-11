@@ -72,6 +72,34 @@ This runs a single backend instance — good for trying the app or day-to-day lo
 
 **Sync model:** each open file is a Yjs `Y.Doc`. The server holds the authoritative doc per file, applies incoming binary updates with `Y.applyUpdate`, rebroadcasts the same update to every other client in the room, and debounce-persists both the merged plaintext and the encoded Yjs state (`Y.encodeStateAsUpdate`) to MongoDB. New joiners — and the server itself after a cold start — get the full doc state from that same encoding rather than replaying history or reconstructing it from plaintext.
 
+**Infrastructure topology** (the multi-instance deploy shape — see [`docker-compose.yml`](docker-compose.yml) / [`load-test/README.md`](load-test/README.md) for the local rig this mirrors; source: [`docs/architecture.mmd`](docs/architecture.mmd)):
+
+```mermaid
+graph TD
+    ClientA["Client A<br/>React + Monaco + Yjs"]
+    ClientB["Client B<br/>React + Monaco + Yjs"]
+    LB["Load Balancer<br/>(nginx)"]
+    BE1["Backend Instance 1<br/>Express + Socket.io"]
+    BE2["Backend Instance 2<br/>Express + Socket.io"]
+    Redis[("Redis<br/>pub/sub + hot cache")]
+    Mongo[("MongoDB<br/>durable state")]
+    Judge0["Judge0<br/>(code execution)"]
+    Gemini["Google Gemini<br/>(AI pair programmer)"]
+
+    ClientA -->|WebSocket| LB
+    ClientB -->|WebSocket| LB
+    LB -->|round-robin| BE1
+    LB -->|round-robin| BE2
+    BE1 -->|pub/sub sync| Redis
+    BE2 -->|pub/sub sync| Redis
+    BE1 -->|reads/writes| Mongo
+    BE2 -->|reads/writes| Mongo
+    BE1 -->|REST| Judge0
+    BE1 -->|REST| Gemini
+    BE2 -->|REST| Judge0
+    BE2 -->|REST| Gemini
+```
+
 ---
 
 ## Features

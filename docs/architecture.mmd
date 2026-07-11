@@ -1,0 +1,23 @@
+graph TD
+    ClientA["Client A<br/>React + Monaco + Yjs"]
+    ClientB["Client B<br/>React + Monaco + Yjs"]
+    LB["Load Balancer<br/>(nginx)"]
+    BE1["Backend Instance 1<br/>Express + Socket.io"]
+    BE2["Backend Instance 2<br/>Express + Socket.io"]
+    Redis[("Redis<br/>pub/sub + hot cache")]
+    Mongo[("MongoDB<br/>durable state")]
+    Judge0["Judge0<br/>(code execution)"]
+    Gemini["Google Gemini<br/>(AI pair programmer)"]
+
+    ClientA -->|WebSocket| LB
+    ClientB -->|WebSocket| LB
+    LB -->|round-robin| BE1
+    LB -->|round-robin| BE2
+    BE1 -->|pub/sub sync| Redis
+    BE2 -->|pub/sub sync| Redis
+    BE1 -->|reads/writes| Mongo
+    BE2 -->|reads/writes| Mongo
+    BE1 -->|REST| Judge0
+    BE1 -->|REST| Gemini
+    BE2 -->|REST| Judge0
+    BE2 -->|REST| Gemini
