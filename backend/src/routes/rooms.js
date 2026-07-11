@@ -295,11 +295,46 @@ router.get("/:roomId", auth, async (req, res) => {
 
 // ─── Code execution ───────────────────────────────────────────────────────────
 
-// POST /api/v1/rooms/execute — run code via Judge0 CE (RapidAPI)
+// Explicit Judge0 limits — without these, Judge0 falls back to whatever
+// defaults the RapidAPI-hosted instance happens to have configured, which
+// this app has no control over or visibility into. Values match Judge0 CE's
+// own documented defaults, made explicit rather than implicit.
+const JUDGE0_CPU_TIME_LIMIT_S  = 5;      // seconds of actual CPU time
+const JUDGE0_WALL_TIME_LIMIT_S = 10;     // seconds of real time (covers I/O waits/sleeps)
+const JUDGE0_MEMORY_LIMIT_KB   = 128000; // 128 MB
+
+// Fetch-level deadline, with headroom over wall_time_limit for Judge0's own
+// queueing/network overhead on top of the sandboxed run itself. Without this,
+// a hung/overloaded Judge0 queue could leave this request hanging indefinitely
+// (wait=true makes the call synchronous).
+const JUDGE0_FETCH_TIMEOUT_MS = 20000;
+
+// Cap on what actually reaches the client/room — a print-heavy submission
+// could otherwise return a very large response that gets broadcast to every
+// socket in the room (see broadcastAndRespond below).
+const MAX_OUTPUT_CHARS = 10000;
+function truncateOutput(output) {
+  if (output.length <= MAX_OUTPUT_CHARS) return output;
+  return output.slice(0, MAX_OUTPUT_CHARS) + `\n... (truncated, ${output.length - MAX_OUTPUT_CHARS} more characters)`;
+}
+
+// POST /api/v1/rooms/:roomId/execute — run code via Judge0 CE (RapidAPI),
+// then broadcast the result to the room ourselves. Room-scoped (not just
+// JWT-authenticated) for two reasons: a client can no longer burn Judge0
+// quota running code for a room it isn't in, and the server needs to know
+// which room to broadcast "run-result" to — that broadcast used to be
+// client-triggered (a plain socket.emit with an arbitrary output string, no
+// connection to a real Judge0 call at all); it's server-only now, see
+// roomService.js.
 // Language IDs: JS=63, TS=74, Python=71, Java=62, C++=54
-router.post("/execute", auth, async (req, res) => {
+router.post("/:roomId/execute", auth, async (req, res) => {
   const { code, language } = req.body;
   if (!code) return res.status(400).json({ error: "Code is required" });
+
+  const room = await Room.findOne({ roomId: req.params.roomId });
+  if (!room) return res.status(404).json({ error: "Room not found" });
+  if (!hasRoomAccess(room, req.user.id))
+    return res.status(403).json({ error: "Not a member of this room" });
 
   if (!process.env.JUDGE0_KEY) {
     return res.status(503).json({ error: "Code execution not configured — add JUDGE0_KEY to backend/.env" });
@@ -307,6 +342,13 @@ router.post("/execute", auth, async (req, res) => {
 
   const LANGUAGE_IDS = { javascript: 63, typescript: 74, python: 71, java: 62, cpp: 54 };
   const languageId = LANGUAGE_IDS[language] || 63;
+  const io = req.app.get("io");
+
+  function broadcastAndRespond(rawOutput, status, httpStatus = 200) {
+    const output = truncateOutput(rawOutput.trim());
+    io.to(req.params.roomId).emit("run-result", { output, runnerName: req.user.name });
+    res.status(httpStatus).json({ output, status });
+  }
 
   try {
     const response = await fetch(
@@ -318,17 +360,27 @@ router.post("/execute", auth, async (req, res) => {
           "X-RapidAPI-Key": process.env.JUDGE0_KEY,
           "X-RapidAPI-Host": "judge0-ce.p.rapidapi.com",
         },
-        body: JSON.stringify({ source_code: code, language_id: languageId }),
+        body: JSON.stringify({
+          source_code: code,
+          language_id: languageId,
+          cpu_time_limit: JUDGE0_CPU_TIME_LIMIT_S,
+          wall_time_limit: JUDGE0_WALL_TIME_LIMIT_S,
+          memory_limit: JUDGE0_MEMORY_LIMIT_KB,
+        }),
+        signal: AbortSignal.timeout(JUDGE0_FETCH_TIMEOUT_MS),
       }
     );
 
     const result = await response.json();
-    const output =
+    const rawOutput =
       result.stdout || result.stderr || result.compile_output || result.message || "(no output)";
-
-    res.json({ output: output.trim(), status: result.status?.description });
+    broadcastAndRespond(rawOutput, result.status?.description);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const timedOut = err.name === "TimeoutError" || err.name === "AbortError";
+    const message = timedOut
+      ? "Code execution timed out — Judge0 took too long to respond"
+      : `Execution failed: ${err.message}`;
+    broadcastAndRespond(message, "Error", timedOut ? 504 : 500);
   }
 });
 
